@@ -1,0 +1,23 @@
+# ============================================================
+# CortexBot Worker — Node.js Dockerfile
+# Handles background job processing via BullMQ
+# ============================================================
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copy package files first (caching)
+COPY workers/package.json workers/package-lock.json* ./
+
+# Install Node.js dependencies
+RUN npm install --production
+
+# Copy worker files
+COPY workers/ .
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD node healthcheck.js || exit 1
+
+CMD ["node", "index.js"]

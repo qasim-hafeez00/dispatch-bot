@@ -1,0 +1,188 @@
+# ============================================================
+# CortexBot Phase 1 — Docker Compose
+#
+# Runs everything you need locally:
+# - cortexbot-api: The FastAPI Python application
+# - cortexbot-worker: Background job processor (BullMQ)
+# - postgres: The database
+# - redis: Caching, event streams, job queues
+# - pgadmin: Visual database browser (open http://localhost:5050)
+# - bull-board: Visual job queue dashboard (open http://localhost:3001)
+# - ngrok: Exposes your local app to the internet for webhooks
+#
+# Start everything: docker compose up -d
+# Stop everything:  docker compose down
+# View logs:        docker compose logs -f
+# ============================================================
+
+version: "3.9"
+
+services:
+
+  # ── Main Python Application ─────────────────────────────────
+  cortexbot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cortexbot-api
+    ports:
+      - "8000:8000"     # FastAPI → http://localhost:8000
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://cortex:cortex@postgres:5432/cortexbot
+      - DATABASE_URL_SYNC=postgresql://cortex:cortex@postgres:5432/cortexbot
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=development
+    env_file:
+      - .env.local      # Your API keys (copy from .env.example)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      # Hot reload: changes to your code automatically restart the server
+      - ./cortexbot:/app/cortexbot
+      - ./scripts:/app/scripts
+      - ./alembic.ini:/app/alembic.ini
+    restart: unless-stopped
+    networks:
+      - cortexbot-network
+
+  # ── Background Worker (BullMQ via Node.js) ──────────────────
+  # Processes background jobs: load searches, email parsing, etc.
+  cortexbot-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: cortexbot-worker
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://cortex:cortex@postgres:5432/cortexbot
+      - API_URL=http://cortexbot-api:8000
+    env_file:
+      - .env.local
+    depends_on:
+      - redis
+      - postgres
+      - cortexbot-api
+    volumes:
+      - ./workers:/app/workers
+    restart: unless-stopped
+    networks:
+      - cortexbot-network
+
+  # ── PostgreSQL Database ──────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: cortexbot-postgres
+    environment:
+      POSTGRES_USER: cortex
+      POSTGRES_PASSWORD: cortex
+      POSTGRES_DB: cortexbot
+    ports:
+      - "5432:5432"     # Connect from host with: psql -h localhost -U cortex -d cortexbot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cortex -d cortexbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - cortexbot-network
+
+  # ── Redis (Cache + Event Bus + Job Queue) ───────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: cortexbot-redis
+    ports:
+      - "6379:6379"     # Connect from host with: redis-cli
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - cortexbot-network
+
+  # ── pgAdmin (Database Browser) ──────────────────────────────
+  # Open: http://localhost:5050
+  # Login: dev@cortexbot.com / devpass
+  # Add server: host=postgres, port=5432, user=cortex, pass=cortex
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: cortexbot-pgadmin
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: dev@cortexbot.com
+      PGADMIN_DEFAULT_PASSWORD: devpass
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    networks:
+      - cortexbot-network
+
+  # ── BullMQ Dashboard (Job Queue Browser) ────────────────────
+  # Open: http://localhost:3001
+  # See all pending, active, completed, and failed jobs
+  bull-board:
+    image: ghcr.io/felixmosh/bullmq-dashboard:latest
+    container_name: cortexbot-bull-board
+    ports:
+      - "3001:3000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      PORT: "3000"
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - cortexbot-network
+
+  # ── ngrok (Webhook Tunnel) ───────────────────────────────────
+  # Exposes http://localhost:8000 to the internet
+  # Open: http://localhost:4040 to see all incoming webhook requests
+  # The public URL changes every restart (use paid plan for fixed URL)
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: cortexbot-ngrok
+    ports:
+      - "4040:4040"     # ngrok inspector
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_TOKEN}
+    command: http cortexbot-api:8000 --log=stdout
+    depends_on:
+      - cortexbot-api
+    restart: unless-stopped
+    networks:
+      - cortexbot-network
+
+# ── Volumes (Persistent Data) ─────────────────────────────────
+# These survive "docker compose down" — only removed with "docker compose down -v"
+volumes:
+  postgres_data:    # All your database data
+  redis_data:       # Redis persistence (events, cache)
+  pgadmin_data:     # pgAdmin settings
+
+# ── Network ───────────────────────────────────────────────────
+# All services communicate on this internal network
+# They reference each other by service name (e.g., "postgres", "redis")
+networks:
+  cortexbot-network:
+    driver: bridge

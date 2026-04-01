@@ -485,6 +485,95 @@ async def add_compliance_doc(carrier_id: str, request: Request):
     return {"success": success, "carrier_id": carrier_id, "doc_type": payload["doc_type"]}
 
 
+@app.post("/api/carriers/{carrier_id}/send-agreement", tags=["Carriers"])
+async def send_service_agreement(carrier_id: str):
+    """
+    PHASE 3C — Agent AA
+    Generate and send the Dispatcher Service Agreement to a carrier via DocuSign.
+    Call this after carrier onboarding is complete but before first dispatch.
+    """
+    from cortexbot.agents.service_agreement import skill_aa_generate_agreement
+    result = await skill_aa_generate_agreement(carrier_id)
+    if not result.get("success"):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=422, content=result)
+    return result
+
+
+@app.post("/webhooks/docusign/service-agreement", tags=["Webhooks"])
+async def docusign_service_agreement_signed(request: Request):
+    """
+    PHASE 3C — Agent AA webhook
+    Receives DocuSign 'envelope-completed' events for carrier service agreements.
+    Activates the carrier in the DB and sends the welcome message.
+
+    DocuSign must be configured to POST to:
+      {base_url}/webhooks/docusign/service-agreement
+    with Connect trigger: envelope-completed
+    """
+    from cortexbot.agents.service_agreement import skill_aa_process_signature
+
+    payload     = await request.json()
+    envelope_id = (
+        payload.get("envelopeId")
+        or payload.get("data", {}).get("envelopeId")
+        or payload.get("envelope_id", "")
+    )
+
+    if not envelope_id:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=422, content={"error": "envelopeId missing"})
+
+    status = payload.get("status") or payload.get("data", {}).get("envelopeSummary", {}).get("status", "")
+    if status.lower() not in ("completed", "signed"):
+        # Not a completed event — acknowledge but do nothing
+        return {"received": True, "action": "no_action", "status": status}
+
+    asyncio.create_task(skill_aa_process_signature(envelope_id, payload))
+    return {"received": True, "envelope_id": envelope_id}
+
+
+@app.post("/internal/emergency-rebroker", tags=["Internal"])
+async def internal_emergency_rebroker(request: Request):
+    """
+    PHASE 3C — Agent CC
+    Manually trigger emergency rebrokering for a load.
+    Also called by BullMQ when GPS-dark or breakdown events fire.
+
+    Body: { load_id, trigger_reason, [carrier_whatsapp, broker_email, ...] }
+    trigger_reason: GPS_DARK | BREAKDOWN | NO_SHOW | CARRIER_QUIT
+    """
+    from cortexbot.agents.emergency_rebroker import skill_cc_emergency_rebroker
+    from cortexbot.core.redis_client import get_state
+
+    payload        = await request.json()
+    load_id        = payload.get("load_id")
+    trigger_reason = payload.get("trigger_reason", "BREAKDOWN")
+
+    if not load_id:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=422, content={"error": "load_id required"})
+
+    # Load state from Redis
+    state = await get_state(f"cortex:state:load:{load_id}") or {"load_id": load_id}
+    state.update({k: v for k, v in payload.items() if k not in ("load_id", "trigger_reason")})
+
+    asyncio.create_task(
+        skill_cc_emergency_rebroker(
+            load_id=load_id,
+            trigger_reason=trigger_reason,
+            state=state,
+        ),
+        name=f"cc_{load_id}",
+    )
+
+    return {
+        "load_id":        load_id,
+        "trigger_reason": trigger_reason,
+        "rebroker_initiated": True,
+    }
+
+
 # ============================================================
 # DISPATCH TRIGGERS
 # ============================================================

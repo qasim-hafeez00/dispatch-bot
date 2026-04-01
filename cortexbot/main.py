@@ -1,13 +1,31 @@
 """
-cortexbot/main.py  — PHASE 2 COMPLETE
+cortexbot/main.py — PHASE 3A FIXED
 
-FastAPI application entry point.
-Phase 2 adds:
-  - Transit monitoring internal routes
-  - Payment follow-up routes
-  - Compliance + claims routes
-  - Fraud check route
-  - Updated orchestrator wiring at DISPATCHED state
+PHASE 3A FIXES (GAP-02 + GAP-12):
+
+GAP-02 — 5 broken /internal/* route handlers:
+  1. /internal/transit-monitor called skill_15_gps_check(load_id) — didn't exist.
+     Fix: now calls skill_15_gps_check from updated s15 module.
+
+  2. /internal/hos-check called skill_14_hos_check(driver_id, load_id) — didn't exist.
+     Fix: added _skill_14_hos_check_wrapper() that builds state and calls
+     skill_14_hos_compliance(state).
+
+  3. /internal/weather-check called skill_23_weather_check(load_id) — didn't exist.
+     Fix: s23_weather_monitoring.py already has skill_23_weather_check(load_id);
+     import corrected.
+
+  4. /internal/payment-followup called run_followup_step(invoice_id, step) — didn't exist.
+     Fix: function added to s19; import corrected.
+
+  5. /internal/rate-data called get_rate_brief(...) — didn't exist in s07.
+     Fix: function added to s07; import corrected.
+
+GAP-12 — ELD webhook routes entirely missing:
+  Samsara and Motive push GPS, geo-fence, and HOS events via webhook.
+  Without routes, geo-fence arrivals never fire → detention clock never
+  starts automatically.
+  Fix: Added POST /webhooks/samsara and POST /webhooks/motive.
 """
 
 import asyncio
@@ -33,7 +51,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"🚀 Starting CortexBot {settings.app_version} ({settings.environment})")
     await init_db()
 
-    from cortexbot.core.redis_client import init_redis, close_redis
+    from cortexbot.core.redis_client import init_redis
     await init_redis()
 
     logger.info("✅ CortexBot ready — all systems online")
@@ -70,9 +88,9 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={
-            "error": "Internal server error",
+            "error":   "Internal server error",
             "message": str(exc) if settings.is_development else "Something went wrong",
-        }
+        },
     )
 
 
@@ -82,7 +100,11 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health", tags=["System"])
 async def health_check():
-    return {"status": "ok", "version": settings.app_version, "environment": settings.environment}
+    return {
+        "status":      "ok",
+        "version":     settings.app_version,
+        "environment": settings.environment,
+    }
 
 
 @app.get("/health/deep", tags=["System"])
@@ -161,19 +183,54 @@ async def docusign_signature_complete(request: Request):
     return {"received": True}
 
 
+# ── GAP-12 FIX: ELD webhook routes ───────────────────────────
+@app.post("/webhooks/samsara", tags=["Webhooks"])
+async def samsara_webhook(request: Request):
+    """
+    GAP-12 FIX: Samsara ELD webhook — GPS, geo-fence, HOS events.
+    Without this route geo-fence arrivals never reach the system
+    and the detention clock never starts automatically.
+    """
+    from cortexbot.webhooks.eld_webhooks import handle_samsara_webhook
+    payload   = await request.json()
+    signature = request.headers.get("X-Samsara-Signature", "")
+    event_type = payload.get("eventType", "unknown")
+    logger.info(f"🛰️ Samsara webhook: {event_type}")
+    asyncio.create_task(handle_samsara_webhook(payload, signature))
+    return {"received": True}
+
+
+@app.post("/webhooks/motive", tags=["Webhooks"])
+async def motive_webhook(request: Request):
+    """
+    GAP-12 FIX: Motive (KeepTruckin) ELD webhook — GPS, geo-fence, HOS events.
+    """
+    from cortexbot.webhooks.eld_webhooks import handle_motive_webhook
+    payload    = await request.json()
+    event_type = payload.get("event_type", "unknown")
+    logger.info(f"🛰️ Motive webhook: {event_type}")
+    asyncio.create_task(handle_motive_webhook(payload))
+    return {"received": True}
+
+
 # ============================================================
 # INTERNAL ROUTES — Bland AI mid-call data injection
 # ============================================================
 
 @app.post("/internal/rate-data", tags=["Internal"])
 async def get_live_rate_data(request: Request):
-    """Called BY Bland AI during a live broker call for live DAT rates."""
+    """
+    GAP-02 FIX: Called BY Bland AI during a live broker call.
+    get_rate_brief now exists in s07_rate_intelligence.
+    """
     from cortexbot.skills.s07_rate_intelligence import get_rate_brief
     payload = await request.json()
     return await get_rate_brief(
-        payload.get("origin_city", ""),
-        payload.get("dest_city", ""),
-        payload.get("equipment", "53_dry_van"),
+        origin_city=payload.get("origin_city", ""),
+        dest_city=payload.get("dest_city", ""),
+        equipment=payload.get("equipment", "53_dry_van"),
+        origin_state=payload.get("origin_state", ""),
+        dest_state=payload.get("dest_state", ""),
     )
 
 
@@ -184,11 +241,12 @@ async def get_live_rate_data(request: Request):
 @app.post("/internal/transit-monitor", tags=["Internal"])
 async def internal_transit_monitor(request: Request):
     """
+    GAP-02 FIX: skill_15_gps_check now exists in s15.
     Trigger a GPS/ETA check for an active load.
     Called by BullMQ transit_monitor queue every 15 minutes.
     """
-    payload  = await request.json()
-    load_id  = payload.get("load_id")
+    payload = await request.json()
+    load_id = payload.get("load_id")
     if not load_id:
         return JSONResponse(status_code=422, content={"error": "load_id required"})
 
@@ -200,23 +258,44 @@ async def internal_transit_monitor(request: Request):
 @app.post("/internal/hos-check", tags=["Internal"])
 async def internal_hos_check(request: Request):
     """
-    Check HOS compliance for a driver.
-    Called by BullMQ hos_check queue every 15 minutes per active load.
+    GAP-02 FIX: skill_14_hos_check did not exist.
+    Added _skill_14_hos_check_wrapper() below which builds a minimal
+    state dict and calls skill_14_hos_compliance(state).
     """
-    payload    = await request.json()
-    driver_id  = payload.get("driver_id")
-    load_id    = payload.get("load_id")
+    payload   = await request.json()
+    driver_id = payload.get("driver_id")
+    load_id   = payload.get("load_id")
     if not driver_id or not load_id:
         return JSONResponse(status_code=422, content={"error": "driver_id and load_id required"})
 
-    from cortexbot.skills.s14_hos_compliance import skill_14_hos_check
-    asyncio.create_task(skill_14_hos_check(driver_id, load_id))
+    asyncio.create_task(_skill_14_hos_check_wrapper(driver_id, load_id))
     return {"driver_id": driver_id, "load_id": load_id, "check_initiated": True}
+
+
+async def _skill_14_hos_check_wrapper(driver_id: str, load_id: str):
+    """
+    GAP-02 FIX: Builds a minimal state dict from Redis and runs skill_14.
+    skill_14_hos_compliance requires a full state dict, not just driver_id.
+    """
+    from cortexbot.core.redis_client import get_state, set_state
+    from cortexbot.skills.s14_hos_compliance import skill_14_hos_compliance
+
+    state = await get_state(f"cortex:state:load:{load_id}") or {}
+    state.setdefault("load_id",    load_id)
+    state.setdefault("carrier_id", driver_id)
+    state.setdefault("driver_id",  driver_id)
+
+    try:
+        updated = await skill_14_hos_compliance(state)
+        await set_state(f"cortex:state:load:{load_id}", updated)
+    except Exception as e:
+        logger.error(f"HOS check failed for driver={driver_id} load={load_id}: {e}")
 
 
 @app.post("/internal/weather-check", tags=["Internal"])
 async def internal_weather_check(request: Request):
     """
+    GAP-02 FIX: skill_23_weather_check now exists in s23_weather_monitoring.py.
     Run weather route scan for an active load.
     Called by BullMQ weather_check queue every 30 minutes.
     """
@@ -225,7 +304,7 @@ async def internal_weather_check(request: Request):
     if not load_id:
         return JSONResponse(status_code=422, content={"error": "load_id required"})
 
-    from cortexbot.skills.s21_s22_s23_ops import skill_23_weather_check
+    from cortexbot.skills.s23_weather_monitoring import skill_23_weather_check
     asyncio.create_task(skill_23_weather_check(load_id))
     return {"load_id": load_id, "check_initiated": True}
 
@@ -233,12 +312,24 @@ async def internal_weather_check(request: Request):
 @app.post("/internal/payment-followup", tags=["Internal"])
 async def internal_payment_followup(request: Request):
     """
+    GAP-02 FIX: run_followup_step now exists in s19.
     Advance payment follow-up sequence for an invoice.
     Called by BullMQ payment_followup queue on scheduled dates.
     """
     payload    = await request.json()
     invoice_id = payload.get("invoice_id")
     step       = payload.get("step")
+
+    # Also support legacy load_id + amount_paid signature used in seed script
+    load_id    = payload.get("load_id")
+    amount_paid = payload.get("amount_paid")
+
+    if amount_paid and load_id:
+        # Payment received — resume settlement pipeline
+        from cortexbot.core.orchestrator import resume_workflow_after_payment
+        asyncio.create_task(resume_workflow_after_payment(load_id, float(amount_paid)))
+        return {"load_id": load_id, "amount_paid": amount_paid, "pipeline_started": True}
+
     if not invoice_id:
         return JSONResponse(status_code=422, content={"error": "invoice_id required"})
 
@@ -261,8 +352,8 @@ async def internal_compliance_sweep():
 @app.post("/internal/claims-deadline-check", tags=["Internal"])
 async def internal_claims_deadline_check():
     """
+    GAP-04 now fixed: sy_freight_claims.py exists.
     Check freight claim deadlines daily.
-    Called by BullMQ compliance_sweep queue (piggybacks on compliance run).
     """
     from cortexbot.skills.sy_freight_claims import skill_y_daily_deadline_check
     result = await skill_y_daily_deadline_check()
@@ -271,12 +362,8 @@ async def internal_claims_deadline_check():
 
 @app.post("/internal/carrier-performance", tags=["Internal"])
 async def internal_carrier_performance(request: Request):
-    """
-    Run weekly carrier performance scoring.
-    Called by BullMQ carrier_performance queue every Monday at 07:00.
-    """
     payload    = await request.json()
-    carrier_id = payload.get("carrier_id")  # None = score all
+    carrier_id = payload.get("carrier_id")
     from cortexbot.skills.s24_s25_relationship_scoring import skill_25_carrier_performance_scoring
     result = await skill_25_carrier_performance_scoring(carrier_id)
     return result
@@ -284,12 +371,8 @@ async def internal_carrier_performance(request: Request):
 
 @app.post("/internal/broker-scoring", tags=["Internal"])
 async def internal_broker_scoring(request: Request):
-    """
-    Run weekly broker relationship scoring.
-    Called by BullMQ weekly cron.
-    """
     payload   = await request.json()
-    broker_id = payload.get("broker_id")  # None = score all
+    broker_id = payload.get("broker_id")
     from cortexbot.skills.s24_s25_relationship_scoring import skill_24_broker_relationship_management
     result = await skill_24_broker_relationship_management(broker_id)
     return result
@@ -297,12 +380,8 @@ async def internal_broker_scoring(request: Request):
 
 @app.post("/internal/backhaul-search", tags=["Internal"])
 async def internal_backhaul_search(request: Request):
-    """
-    Search for backhaul load from delivery city.
-    Called by BullMQ backhaul_search queue at booking time.
-    """
-    payload   = await request.json()
-    load_id   = payload.get("load_id")
+    payload    = await request.json()
+    load_id    = payload.get("load_id")
     carrier_id = payload.get("carrier_id")
 
     from cortexbot.skills.s21_s22_s23_ops import skill_21_backhaul_planning
@@ -318,7 +397,9 @@ async def internal_process_email(email_id: str):
     from sqlalchemy import select
 
     async with get_db_session() as db:
-        result = await db.execute(select(InboundEmail).where(InboundEmail.email_id == email_id))
+        result = await db.execute(
+            select(InboundEmail).where(InboundEmail.email_id == email_id)
+        )
         email = result.scalar_one_or_none()
 
     if not email:
@@ -326,9 +407,9 @@ async def internal_process_email(email_id: str):
 
     from cortexbot.webhooks.sendgrid import handle_inbound_email
     asyncio.create_task(handle_inbound_email({
-        "from": email.from_email,
+        "from":    email.from_email,
         "subject": email.subject,
-        "text": email.body_text or "",
+        "text":    email.body_text or "",
     }))
     return {"email_id": email_id, "reprocessing": True}
 
@@ -349,10 +430,6 @@ async def internal_process_ocr(request: Request):
 
 @app.post("/internal/fraud-check", tags=["Internal"])
 async def internal_fraud_check(request: Request):
-    """
-    Run fraud detection on a broker before booking.
-    Called by orchestrator before skill 10 (load booking).
-    """
     payload    = await request.json()
     broker_mc  = payload.get("broker_mc")
     load_id    = payload.get("load_id")
@@ -391,10 +468,8 @@ async def get_carrier(carrier_id: str):
 
 @app.post("/api/carriers/{carrier_id}/compliance-doc", tags=["Carriers"])
 async def add_compliance_doc(carrier_id: str, request: Request):
-    """Add or update a carrier compliance document."""
     payload = await request.json()
     from cortexbot.skills.s26_s27_compliance_accessorials import upsert_compliance_doc
-    from datetime import date as date_type
     import datetime
 
     expiry_str = payload.get("expiry_date")
@@ -433,8 +508,7 @@ async def start_dispatch(carrier_id: str, request: Request):
 
 @app.post("/api/dispatch/record-payment/{load_id}", tags=["Dispatch"])
 async def record_payment(load_id: str, request: Request):
-    """Record payment received for a load. Triggers settlement pipeline."""
-    payload = await request.json()
+    payload    = await request.json()
     invoice_id = payload.get("invoice_id")
     amount_paid = payload.get("amount_paid")
 
@@ -442,13 +516,14 @@ async def record_payment(load_id: str, request: Request):
         return JSONResponse(status_code=422, content={"error": "invoice_id and amount_paid required"})
 
     from cortexbot.skills.s19_payment_reconciliation import record_payment_received
-    result = await record_payment_received(invoice_id, float(amount_paid))
+    from cortexbot.core.redis_client import get_state
+    state = await get_state(f"cortex:state:load:{load_id}") or {"load_id": load_id}
+    result = await record_payment_received(load_id, float(amount_paid), state)
     return result
 
 
 @app.post("/api/dispatch/open-claim/{load_id}", tags=["Dispatch"])
 async def open_freight_claim(load_id: str, request: Request):
-    """Open a freight claim for a load."""
     payload = await request.json()
     from cortexbot.skills.sy_freight_claims import skill_y_open_freight_claim
     result = await skill_y_open_freight_claim(
@@ -479,9 +554,9 @@ async def get_load(load_id: str):
 
 @app.get("/api/loads/{load_id}/invoice", tags=["Loads"])
 async def get_load_invoice(load_id: str):
-    """Get invoice details for a load."""
-    from sqlalchemy import select, text as sa_text
-    async with __import__("cortexbot.db.session", fromlist=["get_db_session"]).get_db_session() as db:
+    from sqlalchemy import text as sa_text
+    from cortexbot.db.session import get_db_session
+    async with get_db_session() as db:
         result = await db.execute(sa_text("""
             SELECT invoice_id, invoice_number, total_amount, status,
                    due_date, amount_paid, payment_received_date, days_to_pay
@@ -510,19 +585,15 @@ async def get_load_invoice(load_id: str):
 
 @app.post("/api/advances/request", tags=["Advances"])
 async def request_driver_advance(request: Request):
-    """
-    Issue a fuel/lumper/emergency advance to a driver.
-    Returns EFS or Comdata check code.
-    """
     payload = await request.json()
     from cortexbot.skills.sq_sr_ss_st_financial import skill_s_driver_advance
-    result = await skill_s_driver_advance({
-        "carrier_id":       payload["carrier_id"],
-        "load_id":          payload.get("load_id"),
-        "advance_type":     payload.get("advance_type", "FUEL"),
-        "amount_requested": float(payload.get("amount", 200)),
-        "carrier_whatsapp": payload.get("carrier_whatsapp", ""),
-    })
+    result = await skill_s_driver_advance(
+        carrier_id=payload["carrier_id"],
+        load_id=payload.get("load_id", ""),
+        advance_type=payload.get("advance_type", "FUEL"),
+        amount_requested=float(payload.get("amount", 200)),
+        state={"carrier_whatsapp": payload.get("carrier_whatsapp", "")},
+    )
     return result
 
 
@@ -537,9 +608,9 @@ async def simulate_whatsapp(request: Request):
     payload = await request.json()
     from cortexbot.webhooks.twilio import handle_whatsapp_inbound
     await handle_whatsapp_inbound({
-        "From":      f"whatsapp:{payload['from']}",
-        "Body":      payload["body"],
-        "NumMedia":  str(len(payload.get("media_urls", []))),
+        "From":     f"whatsapp:{payload['from']}",
+        "Body":     payload["body"],
+        "NumMedia": str(len(payload.get("media_urls", []))),
     })
     return {"simulated": True}
 
@@ -583,7 +654,7 @@ async def debug_inject_rc(load_id: str, request: Request):
     if not settings.is_development:
         return JSONResponse(status_code=404, content={"error": "Not found"})
     payload = await request.json()
-    s3_url = payload.get("s3_url", "s3://cortexbot-docs/samples/sample_rc.pdf")
+    s3_url  = payload.get("s3_url", "s3://cortexbot-docs/samples/sample_rc.pdf")
     from cortexbot.core.orchestrator import resume_workflow_after_rc
     await resume_workflow_after_rc(load_id, s3_url)
     return {"load_id": load_id, "rc_injected": True, "s3_url": s3_url}
@@ -609,7 +680,6 @@ async def simulate_carrier_no(load_id: str):
 
 @app.post("/debug/simulate/delivery/{load_id}", tags=["Debug"])
 async def simulate_delivery(load_id: str):
-    """Simulate driver confirming delivery — triggers POD + invoice pipeline."""
     if not settings.is_development:
         return JSONResponse(status_code=404, content={"error": "Not found"})
     from cortexbot.core.orchestrator_phase2 import handle_delivery_confirmed
@@ -619,7 +689,6 @@ async def simulate_delivery(load_id: str):
 
 @app.post("/debug/simulate/fraud-check", tags=["Debug"])
 async def simulate_fraud_check(request: Request):
-    """Test fraud detection on a broker MC."""
     if not settings.is_development:
         return JSONResponse(status_code=404, content={"error": "Not found"})
     payload = await request.json()
@@ -643,5 +712,5 @@ async def debug_queue_depths():
             "transit_monitor":    await r.llen("bull:cortex:transit_monitor:wait"),
             "payment_followup":   await r.llen("bull:cortex:payment_followup:wait"),
             "compliance_sweep":   await r.llen("bull:cortex:compliance_sweep:wait"),
-        }
+        },
     }

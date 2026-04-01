@@ -1,6 +1,19 @@
 """
-cortexbot/db/models.py
-Database table definitions — Phase 1 + Phase 2.
+cortexbot/db/models.py — PHASE 3A FIXED
+
+PHASE 3A FIX (GAP-09):
+The Load model had inconsistent column names for detention hours:
+  - models.py used:   detention_pickup_hrs / detention_delivery_hrs
+  - s27 accessed:     detention_pickup_hours / detention_delivery_hours
+  → AttributeError → always returned 0 → invoices underbilled for detention
+
+Fix:
+  1. Renamed canonical columns to *_hours (matches s27 + migration 002).
+  2. Added backward-compat @property aliases for *_hrs so existing code
+     that uses the old spelling continues to work without changes.
+  3. Added missing Phase 2 financial columns that migration 002 adds via
+     op.add_column but were absent from the ORM model:
+       amount_paid, payment_received_date
 """
 
 import uuid
@@ -20,12 +33,6 @@ from sqlalchemy.sql import func
 class Base(DeclarativeBase):
     pass
 
-
-# ============================================================
-# PHASE 1 TABLES (unchanged from Phase 1)
-# carriers, brokers, broker_contacts, loads, events,
-# load_checkpoints, inbound_emails, call_log, whatsapp_context
-# ============================================================
 
 class Carrier(Base):
     __tablename__ = "carriers"
@@ -58,23 +65,23 @@ class Carrier(Base):
     w9_url             = Column(Text, nullable=True)
     coi_url            = Column(Text, nullable=True)
 
-    # Phase 2 additions
-    eld_provider       = Column(String(30), nullable=True)   # samsara | motive | none
-    eld_vehicle_id     = Column(String(100), nullable=True)  # Vehicle ID in ELD system
-    eld_driver_id      = Column(String(100), nullable=True)  # Driver ID in ELD system
-    stripe_account_id  = Column(String(100), nullable=True)  # Stripe Connect account
-    bank_account_last4 = Column(String(4), nullable=True)    # For display only
-    truck_weight_lbs   = Column(Integer, default=17000)      # Tare weight (truck)
-    trailer_weight_lbs = Column(Integer, default=13000)      # Tare weight (trailer)
-    truck_mpg          = Column(Numeric(4, 1), default=6.5)  # For fuel optimization
-    fuel_card_network  = Column(String(30), nullable=True)   # efs | comdata | pilot | loves
+    # Phase 2
+    eld_provider       = Column(String(30), nullable=True)
+    eld_vehicle_id     = Column(String(100), nullable=True)
+    eld_driver_id      = Column(String(100), nullable=True)
+    stripe_account_id  = Column(String(100), nullable=True)
+    bank_account_last4 = Column(String(4), nullable=True)
+    truck_weight_lbs   = Column(Integer, default=17000)
+    trailer_weight_lbs = Column(Integer, default=13000)
+    truck_mpg          = Column(Numeric(4, 1), default=6.5)
+    fuel_card_network  = Column(String(30), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    loads      = relationship("Load", back_populates="carrier")
+    loads       = relationship("Load", back_populates="carrier")
     settlements = relationship("DriverSettlement", back_populates="carrier")
-    advances   = relationship("DriverAdvance", back_populates="carrier")
+    advances    = relationship("DriverAdvance", back_populates="carrier")
 
     def __repr__(self):
         return f"<Carrier {self.mc_number} — {self.company_name}>"
@@ -92,11 +99,9 @@ class Broker(Base):
     blacklisted        = Column(Boolean, default=False)
     blacklist_reason   = Column(Text, nullable=True)
     loads_booked       = Column(Integer, default=0)
-
-    # Phase 2 additions
-    ap_email           = Column(String(200), nullable=True)  # Accounts payable email
+    ap_email           = Column(String(200), nullable=True)
     ap_phone           = Column(String(30), nullable=True)
-    ops_manager_email  = Column(String(200), nullable=True)  # For 14-day escalation
+    ops_manager_email  = Column(String(200), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -145,7 +150,7 @@ class Load(Base):
     origin_city       = Column(String(100), nullable=True)
     origin_state      = Column(CHAR(2), nullable=True)
     origin_zip        = Column(String(10), nullable=True)
-    origin_lat        = Column(Numeric(9, 6), nullable=True)   # Phase 2: geo-fence
+    origin_lat        = Column(Numeric(9, 6), nullable=True)
     origin_lng        = Column(Numeric(9, 6), nullable=True)
     destination_address = Column(Text, nullable=True)
     destination_city  = Column(String(100), nullable=True)
@@ -214,70 +219,93 @@ class Load(Base):
     call_recording_url = Column(Text, nullable=True)
     extracted_call_data = Column(JSONB, nullable=True)
 
-    # ── Phase 2 Fields ────────────────────────────────────────
-
-    # Transit tracking
-    eld_provider      = Column(String(30), nullable=True)
-    last_gps_lat      = Column(Numeric(9, 6), nullable=True)
-    last_gps_lng      = Column(Numeric(9, 6), nullable=True)
-    last_gps_speed_mph = Column(Numeric(5, 1), nullable=True)
-    last_gps_updated  = Column(DateTime(timezone=True), nullable=True)
-    current_eta       = Column(DateTime(timezone=True), nullable=True)
-    delay_minutes     = Column(Integer, nullable=True)
+    # ── Phase 2: Transit tracking ─────────────────────────────
+    eld_provider          = Column(String(30), nullable=True)
+    last_gps_lat          = Column(Numeric(9, 6), nullable=True)
+    last_gps_lng          = Column(Numeric(9, 6), nullable=True)
+    last_gps_speed_mph    = Column(Numeric(5, 1), nullable=True)
+    last_gps_updated      = Column(DateTime(timezone=True), nullable=True)
+    current_eta           = Column(DateTime(timezone=True), nullable=True)
+    delay_minutes         = Column(Integer, nullable=True)
     broker_delay_notified = Column(Boolean, default=False)
 
-    # Transit milestones (Phase 2)
-    arrived_pickup_at   = Column(DateTime(timezone=True), nullable=True)
-    loaded_at           = Column(DateTime(timezone=True), nullable=True)
-    departed_pickup_at  = Column(DateTime(timezone=True), nullable=True)
-    arrived_delivery_at = Column(DateTime(timezone=True), nullable=True)
-    delivered_at        = Column(DateTime(timezone=True), nullable=True)
+    # Transit milestones
+    arrived_pickup_at     = Column(DateTime(timezone=True), nullable=True)
+    loaded_at             = Column(DateTime(timezone=True), nullable=True)
+    departed_pickup_at    = Column(DateTime(timezone=True), nullable=True)
+    arrived_delivery_at   = Column(DateTime(timezone=True), nullable=True)
+    delivered_at          = Column(DateTime(timezone=True), nullable=True)
 
-    # Detention summary (Phase 2)
-    detention_pickup_hrs    = Column(Numeric(5, 2), nullable=True)
-    detention_pickup_amount = Column(Numeric(7, 2), nullable=True)
-    detention_delivery_hrs  = Column(Numeric(5, 2), nullable=True)
+    # ── Phase 2: Detention summary ────────────────────────────
+    # GAP-09 FIX: renamed _hrs → _hours to match what s27 actually reads.
+    # Backward-compatible @property aliases for *_hrs are provided below.
+    detention_pickup_hours    = Column(Numeric(5, 2), nullable=True)
+    detention_pickup_amount   = Column(Numeric(7, 2), nullable=True)
+    detention_delivery_hours  = Column(Numeric(5, 2), nullable=True)
     detention_delivery_amount = Column(Numeric(7, 2), nullable=True)
-    tonu_triggered          = Column(Boolean, default=False)
-    tonu_claimed_amount     = Column(Numeric(7, 2), nullable=True)
+    tonu_triggered            = Column(Boolean, default=False)
+    tonu_claimed_amount       = Column(Numeric(7, 2), nullable=True)
 
-    # Lumper (Phase 2)
+    # Lumper
     lumper_actual_amount  = Column(Numeric(7, 2), nullable=True)
     lumper_receipt_url    = Column(Text, nullable=True)
 
-    # POD documents (Phase 2)
+    # POD documents
     bol_pickup_url    = Column(Text, nullable=True)
     bol_delivery_url  = Column(Text, nullable=True)
     pod_url           = Column(Text, nullable=True)
     pod_collected_at  = Column(DateTime(timezone=True), nullable=True)
 
-    # Financial summary (Phase 2)
-    gross_revenue     = Column(Numeric(10, 2), nullable=True)
-    total_accessorials = Column(Numeric(10, 2), nullable=True)
-    total_invoice_amount = Column(Numeric(10, 2), nullable=True)
-    dispatch_fee_amount = Column(Numeric(8, 2), nullable=True)
+    # ── Phase 2: Financial summary ────────────────────────────
+    # GAP-09 FIX: amount_paid and payment_received_date were added by
+    # migration 002 via op.add_column but never declared in the ORM model.
+    # api/loads.py accessed load.amount_paid → AttributeError → 500.
+    amount_paid              = Column(Numeric(10, 2), nullable=True)
+    payment_received_date    = Column(Date, nullable=True)
+    gross_revenue            = Column(Numeric(10, 2), nullable=True)
+    total_accessorials       = Column(Numeric(10, 2), nullable=True)
+    total_invoice_amount     = Column(Numeric(10, 2), nullable=True)
+    dispatch_fee_amount      = Column(Numeric(8, 2), nullable=True)
     driver_settlement_amount = Column(Numeric(10, 2), nullable=True)
 
-    # Timestamps (Phase 1)
-    searched_at         = Column(DateTime(timezone=True), nullable=True)
-    broker_called_at    = Column(DateTime(timezone=True), nullable=True)
-    rate_agreed_at      = Column(DateTime(timezone=True), nullable=True)
-    carrier_confirmed_at = Column(DateTime(timezone=True), nullable=True)
-    booked_at           = Column(DateTime(timezone=True), nullable=True)
-    rc_received_at      = Column(DateTime(timezone=True), nullable=True)
-    rc_signed_at        = Column(DateTime(timezone=True), nullable=True)
-    dispatched_at       = Column(DateTime(timezone=True), nullable=True)
+    # Timestamps
+    searched_at           = Column(DateTime(timezone=True), nullable=True)
+    broker_called_at      = Column(DateTime(timezone=True), nullable=True)
+    rate_agreed_at        = Column(DateTime(timezone=True), nullable=True)
+    carrier_confirmed_at  = Column(DateTime(timezone=True), nullable=True)
+    booked_at             = Column(DateTime(timezone=True), nullable=True)
+    rc_received_at        = Column(DateTime(timezone=True), nullable=True)
+    rc_signed_at          = Column(DateTime(timezone=True), nullable=True)
+    dispatched_at         = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    carrier    = relationship("Carrier", back_populates="loads")
-    broker     = relationship("Broker", back_populates="loads")
-    invoices   = relationship("Invoice", back_populates="load")
+    carrier           = relationship("Carrier", back_populates="loads")
+    broker            = relationship("Broker", back_populates="loads")
+    invoices          = relationship("Invoice", back_populates="load")
     detention_records = relationship("DetentionRecord", back_populates="load")
-    check_calls = relationship("CheckCall", back_populates="load")
-    transit_events = relationship("TransitEvent", back_populates="load")
-    weather_alerts = relationship("WeatherAlert", back_populates="load")
+    check_calls       = relationship("CheckCall", back_populates="load")
+    transit_events    = relationship("TransitEvent", back_populates="load")
+    weather_alerts    = relationship("WeatherAlert", back_populates="load")
+
+    # ── GAP-09 FIX: backward-compat property aliases ──────────
+    # Code that used the old _hrs spelling continues to work unchanged.
+    @property
+    def detention_pickup_hrs(self):
+        return self.detention_pickup_hours
+
+    @detention_pickup_hrs.setter
+    def detention_pickup_hrs(self, value):
+        self.detention_pickup_hours = value
+
+    @property
+    def detention_delivery_hrs(self):
+        return self.detention_delivery_hours
+
+    @detention_delivery_hrs.setter
+    def detention_delivery_hrs(self, value):
+        self.detention_delivery_hours = value
 
     def __repr__(self):
         return f"<Load {self.tms_ref} — {self.status}>"
@@ -300,7 +328,7 @@ class Event(Base):
 
     __table_args__ = (
         Index("idx_events_entity", "entity_type", "entity_id"),
-        Index("idx_events_code", "event_code"),
+        Index("idx_events_code",   "event_code"),
         Index("idx_events_created", "created_at"),
     )
 
@@ -308,99 +336,90 @@ class Event(Base):
 class LoadCheckpoint(Base):
     __tablename__ = "load_checkpoints"
 
-    load_id       = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), primary_key=True)
-    state_json    = Column(JSONB, nullable=False)
-    current_skill = Column(String(60), nullable=True)
+    load_id        = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), primary_key=True)
+    state_json     = Column(JSONB, nullable=False)
+    current_skill  = Column(String(60), nullable=True)
     checkpoint_seq = Column(Integer, default=0)
-    updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_at     = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class InboundEmail(Base):
     __tablename__ = "inbound_emails"
 
-    email_id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    message_id        = Column(String(200), unique=True, nullable=True)
-    from_email        = Column(String(200), nullable=True)
-    to_email          = Column(String(200), nullable=True)
-    subject           = Column(Text, nullable=True)
-    body_text         = Column(Text, nullable=True)
-    body_html         = Column(Text, nullable=True)
-    has_attachment    = Column(Boolean, default=False)
-    attachment_s3_url = Column(Text, nullable=True)
+    email_id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    message_id         = Column(String(200), unique=True, nullable=True)
+    from_email         = Column(String(200), nullable=True)
+    to_email           = Column(String(200), nullable=True)
+    subject            = Column(Text, nullable=True)
+    body_text          = Column(Text, nullable=True)
+    body_html          = Column(Text, nullable=True)
+    has_attachment     = Column(Boolean, default=False)
+    attachment_s3_url  = Column(Text, nullable=True)
     attachment_filename = Column(String(200), nullable=True)
-    category          = Column(String(30), nullable=True)
-    confidence        = Column(Numeric(4, 3), nullable=True)
-    load_id           = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=True)
-    carrier_id        = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
-    processed         = Column(Boolean, default=False)
-    processed_at      = Column(DateTime(timezone=True), nullable=True)
-    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    category           = Column(String(30), nullable=True)
+    confidence         = Column(Numeric(4, 3), nullable=True)
+    load_id            = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=True)
+    carrier_id         = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
+    processed          = Column(Boolean, default=False)
+    processed_at       = Column(DateTime(timezone=True), nullable=True)
+    created_at         = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class CallLog(Base):
     __tablename__ = "call_log"
 
-    call_id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    bland_ai_call_id = Column(String(100), unique=True, nullable=True)
-    load_id          = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=True)
-    carrier_id       = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
-    broker_phone     = Column(String(30), nullable=True)
-    outcome          = Column(String(30), nullable=True)
-    agreed_rate_cpm  = Column(Numeric(5, 3), nullable=True)
+    call_id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bland_ai_call_id  = Column(String(100), unique=True, nullable=True)
+    load_id           = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=True)
+    carrier_id        = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
+    broker_phone      = Column(String(30), nullable=True)
+    outcome           = Column(String(30), nullable=True)
+    agreed_rate_cpm   = Column(Numeric(5, 3), nullable=True)
     call_duration_sec = Column(Integer, nullable=True)
-    recording_url    = Column(Text, nullable=True)
-    transcript_raw   = Column(Text, nullable=True)
-    extracted_data   = Column(JSONB, nullable=True)
-    created_at       = Column(DateTime(timezone=True), server_default=func.now())
+    recording_url     = Column(Text, nullable=True)
+    transcript_raw    = Column(Text, nullable=True)
+    extracted_data    = Column(JSONB, nullable=True)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class WhatsAppContext(Base):
     __tablename__ = "whatsapp_context"
 
-    phone            = Column(String(30), primary_key=True)
-    carrier_id       = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
-    current_load_id  = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=True)
-    awaiting         = Column(String(50), nullable=True)
-    language         = Column(String(10), default="en")
+    phone             = Column(String(30), primary_key=True)
+    carrier_id        = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
+    current_load_id   = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=True)
+    awaiting          = Column(String(50), nullable=True)
+    language          = Column(String(10), default="en")
     conversation_json = Column(JSONB, default=list)
-    last_message_at  = Column(DateTime(timezone=True), nullable=True)
-    updated_at       = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    last_message_at   = Column(DateTime(timezone=True), nullable=True)
+    updated_at        = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 # ============================================================
-# PHASE 2 TABLES
+# PHASE 2 TABLES (unchanged from Phase 2)
 # ============================================================
 
 class TransitEvent(Base):
-    """GPS/ELD events during load transit."""
     __tablename__ = "transit_events"
 
-    event_id    = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    load_id     = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
-    carrier_id  = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
-    event_type  = Column(String(50), nullable=False)
-    # TYPES: GPS_UPDATE | GEOFENCE_ENTER | GEOFENCE_EXIT | HOS_ALERT |
-    #        CHECKCALL_DUE | CHECKCALL_RESPONSE | DELAY_DETECTED |
-    #        BREAKDOWN | WEATHER_ALERT
-
-    lat         = Column(Numeric(9, 6), nullable=True)
-    lng         = Column(Numeric(9, 6), nullable=True)
-    speed_mph   = Column(Numeric(5, 1), nullable=True)
-    heading     = Column(Integer, nullable=True)
-    odometer    = Column(Integer, nullable=True)
-
-    # HOS snapshot at event time
-    hos_drive_remaining = Column(Numeric(4, 2), nullable=True)
+    event_id     = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    load_id      = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
+    carrier_id   = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
+    event_type   = Column(String(50), nullable=False)
+    lat          = Column(Numeric(9, 6), nullable=True)
+    lng          = Column(Numeric(9, 6), nullable=True)
+    speed_mph    = Column(Numeric(5, 1), nullable=True)
+    heading      = Column(Integer, nullable=True)
+    odometer     = Column(Integer, nullable=True)
+    hos_drive_remaining  = Column(Numeric(4, 2), nullable=True)
     hos_window_remaining = Column(Numeric(4, 2), nullable=True)
+    eld_provider = Column(String(30), nullable=True)
+    raw_eld_data = Column(JSONB, nullable=True)
+    notes        = Column(Text, nullable=True)
+    event_ts     = Column(DateTime(timezone=True), nullable=False)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
 
-    eld_provider    = Column(String(30), nullable=True)
-    raw_eld_data    = Column(JSONB, nullable=True)
-    notes           = Column(Text, nullable=True)
-
-    event_ts    = Column(DateTime(timezone=True), nullable=False)
-    created_at  = Column(DateTime(timezone=True), server_default=func.now())
-
-    load    = relationship("Load", back_populates="transit_events")
+    load = relationship("Load", back_populates="transit_events")
 
     __table_args__ = (
         Index("idx_transit_load_ts", "load_id", "event_ts"),
@@ -409,23 +428,19 @@ class TransitEvent(Base):
 
 
 class CheckCall(Base):
-    """Scheduled check-call log."""
     __tablename__ = "check_calls"
 
-    checkcall_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    load_id      = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
-    sequence     = Column(Integer, nullable=False)  # 1=depart PU, 2,3...=2hr checks
-    scheduled_at = Column(DateTime(timezone=True), nullable=False)
-    sent_at      = Column(DateTime(timezone=True), nullable=True)
-    responded_at = Column(DateTime(timezone=True), nullable=True)
-    status       = Column(String(20), default="PENDING")
-    # PENDING | SENT | RESPONDED | MISSED | ESCALATED
-
+    checkcall_id    = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    load_id         = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
+    sequence        = Column(Integer, nullable=False)
+    scheduled_at    = Column(DateTime(timezone=True), nullable=False)
+    sent_at         = Column(DateTime(timezone=True), nullable=True)
+    responded_at    = Column(DateTime(timezone=True), nullable=True)
+    status          = Column(String(20), default="PENDING")
     driver_response = Column(Text, nullable=True)
     driver_location = Column(String(200), nullable=True)
     driver_eta      = Column(String(100), nullable=True)
-
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
     load = relationship("Load", back_populates="check_calls")
 
@@ -436,35 +451,28 @@ class CheckCall(Base):
 
 
 class DetentionRecord(Base):
-    """Detention billing records per load stop."""
     __tablename__ = "detention_records"
 
-    detention_id     = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    load_id          = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
-    stop_type        = Column(String(20), nullable=False)  # pickup | delivery
-    facility_name    = Column(String(200), nullable=True)
-    facility_address = Column(Text, nullable=True)
-
-    arrival_ts       = Column(DateTime(timezone=True), nullable=False)
-    departure_ts     = Column(DateTime(timezone=True), nullable=True)
-    total_hours      = Column(Numeric(5, 2), nullable=True)
-    free_hours       = Column(Integer, default=2)
-    billable_hours   = Column(Numeric(5, 2), nullable=True)
-    hourly_rate      = Column(Numeric(7, 2), nullable=True)
-    total_amount     = Column(Numeric(8, 2), nullable=True)
-
-    # Documentation
-    bol_times_noted  = Column(Boolean, default=False)
+    detention_id      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    load_id           = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
+    stop_type         = Column(String(20), nullable=False)
+    facility_name     = Column(String(200), nullable=True)
+    facility_address  = Column(Text, nullable=True)
+    arrival_ts        = Column(DateTime(timezone=True), nullable=False)
+    departure_ts      = Column(DateTime(timezone=True), nullable=True)
+    total_hours       = Column(Numeric(5, 2), nullable=True)
+    free_hours        = Column(Integer, default=2)
+    billable_hours    = Column(Numeric(5, 2), nullable=True)
+    hourly_rate       = Column(Numeric(7, 2), nullable=True)
+    total_amount      = Column(Numeric(8, 2), nullable=True)
+    bol_times_noted   = Column(Boolean, default=False)
     broker_pre_alerted = Column(Boolean, default=False)
     broker_alerted_at = Column(DateTime(timezone=True), nullable=True)
-    bol_in_time      = Column(String(20), nullable=True)
-    bol_out_time     = Column(String(20), nullable=True)
-
-    status           = Column(String(20), default="TRACKING")
-    # TRACKING | COMPLETED | INVOICED | DISPUTED | PAID
-
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    bol_in_time       = Column(String(20), nullable=True)
+    bol_out_time      = Column(String(20), nullable=True)
+    status            = Column(String(20), default="TRACKING")
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     load = relationship("Load", back_populates="detention_records")
 
@@ -475,195 +483,147 @@ class DetentionRecord(Base):
 
 
 class Invoice(Base):
-    """Invoice lifecycle from generation to payment."""
     __tablename__ = "invoices"
 
-    invoice_id       = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    invoice_number   = Column(String(50), unique=True, nullable=False)  # INV-TMS-2026-0001
-    load_id          = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
-    carrier_id       = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=False)
-    broker_id        = Column(UUID(as_uuid=True), ForeignKey("brokers.broker_id"), nullable=True)
-
-    # Amounts
-    linehaul_amount  = Column(Numeric(10, 2), nullable=False)
-    detention_amount = Column(Numeric(8, 2), default=0)
-    lumper_amount    = Column(Numeric(8, 2), default=0)
-    tonu_amount      = Column(Numeric(7, 2), default=0)
+    invoice_id        = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    invoice_number    = Column(String(50), unique=True, nullable=False)
+    load_id           = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
+    carrier_id        = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=False)
+    broker_id         = Column(UUID(as_uuid=True), ForeignKey("brokers.broker_id"), nullable=True)
+    linehaul_amount   = Column(Numeric(10, 2), nullable=False)
+    detention_amount  = Column(Numeric(8, 2), default=0)
+    lumper_amount     = Column(Numeric(8, 2), default=0)
+    tonu_amount       = Column(Numeric(7, 2), default=0)
     extra_stop_amount = Column(Numeric(7, 2), default=0)
     driver_assist_amount = Column(Numeric(7, 2), default=0)
-    fuel_surcharge   = Column(Numeric(8, 2), default=0)
-    total_amount     = Column(Numeric(10, 2), nullable=False)
-
-    # Payment terms
+    fuel_surcharge    = Column(Numeric(8, 2), default=0)
+    total_amount      = Column(Numeric(10, 2), nullable=False)
     payment_terms_days = Column(Integer, default=30)
-    due_date         = Column(Date, nullable=False)
-    quick_pay_pct    = Column(Numeric(4, 3), nullable=True)
-
-    # Status lifecycle
-    status           = Column(String(30), default="GENERATED")
-    # GENERATED | SUBMITTED_FACTORING | SUBMITTED_DIRECT |
-    # FACTORING_ADVANCED | PENDING_PAYMENT | PAID | SHORT_PAID |
-    # DISPUTED | IN_COLLECTIONS | WRITTEN_OFF
-
-    # Factoring
-    factoring_used         = Column(Boolean, default=False)
-    factoring_company      = Column(String(100), nullable=True)
+    due_date          = Column(Date, nullable=False)
+    quick_pay_pct     = Column(Numeric(4, 3), nullable=True)
+    status            = Column(String(30), default="GENERATED")
+    factoring_used    = Column(Boolean, default=False)
+    factoring_company = Column(String(100), nullable=True)
     factoring_submission_id = Column(String(100), nullable=True)
     factoring_advance_amount = Column(Numeric(10, 2), nullable=True)
-    factoring_advanced_at  = Column(DateTime(timezone=True), nullable=True)
-
-    # Document URLs
-    invoice_pdf_url  = Column(Text, nullable=True)
+    factoring_advanced_at   = Column(DateTime(timezone=True), nullable=True)
+    invoice_pdf_url   = Column(Text, nullable=True)
     submitted_to_email = Column(String(200), nullable=True)
-
-    # Payment tracking
-    amount_paid      = Column(Numeric(10, 2), nullable=True)
-    paid_at          = Column(DateTime(timezone=True), nullable=True)
-    payment_variance = Column(Numeric(8, 2), nullable=True)  # paid - invoiced
-
-    # Follow-up
+    amount_paid       = Column(Numeric(10, 2), nullable=True)
+    paid_at           = Column(DateTime(timezone=True), nullable=True)
+    payment_variance  = Column(Numeric(8, 2), nullable=True)
     last_reminder_sent = Column(DateTime(timezone=True), nullable=True)
-    reminder_count   = Column(Integer, default=0)
-    dispute_reason   = Column(Text, nullable=True)
+    reminder_count    = Column(Integer, default=0)
+    dispute_reason    = Column(Text, nullable=True)
     dispute_opened_at = Column(DateTime(timezone=True), nullable=True)
     dispute_resolved_at = Column(DateTime(timezone=True), nullable=True)
     collections_referred_at = Column(DateTime(timezone=True), nullable=True)
+    generated_at      = Column(DateTime(timezone=True), server_default=func.now())
+    submitted_at      = Column(DateTime(timezone=True), nullable=True)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    # Timestamps
-    generated_at     = Column(DateTime(timezone=True), server_default=func.now())
-    submitted_at     = Column(DateTime(timezone=True), nullable=True)
-    created_at       = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at       = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-    load    = relationship("Load", back_populates="invoices")
-    carrier = relationship("Carrier")
-    broker  = relationship("Broker", back_populates="invoices")
+    load       = relationship("Load", back_populates="invoices")
+    carrier    = relationship("Carrier")
+    broker     = relationship("Broker", back_populates="invoices")
     line_items = relationship("InvoiceLineItem", back_populates="invoice")
     payments   = relationship("Payment", back_populates="invoice")
 
     __table_args__ = (
-        Index("idx_invoice_load", "load_id"),
+        Index("idx_invoice_load",   "load_id"),
         Index("idx_invoice_status", "status"),
-        Index("idx_invoice_due", "due_date"),
+        Index("idx_invoice_due",    "due_date"),
     )
 
 
 class InvoiceLineItem(Base):
-    """Individual line items on an invoice."""
     __tablename__ = "invoice_line_items"
 
-    item_id      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    invoice_id   = Column(UUID(as_uuid=True), ForeignKey("invoices.invoice_id"), nullable=False)
-    item_type    = Column(String(50), nullable=False)
-    # linehaul | detention_pickup | detention_delivery | lumper |
-    # tonu | extra_stop | driver_assist | fuel_surcharge
-
-    description  = Column(String(300), nullable=True)
-    quantity     = Column(Numeric(7, 3), nullable=True)  # hours, miles, etc.
-    unit         = Column(String(20), nullable=True)      # hrs | miles | flat
-    unit_rate    = Column(Numeric(8, 2), nullable=True)
-    amount       = Column(Numeric(10, 2), nullable=False)
-    documented   = Column(Boolean, default=True)
-    proof_url    = Column(Text, nullable=True)
+    item_id     = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    invoice_id  = Column(UUID(as_uuid=True), ForeignKey("invoices.invoice_id"), nullable=False)
+    item_type   = Column(String(50), nullable=False)
+    description = Column(String(300), nullable=True)
+    quantity    = Column(Numeric(7, 3), nullable=True)
+    unit        = Column(String(20), nullable=True)
+    unit_rate   = Column(Numeric(8, 2), nullable=True)
+    amount      = Column(Numeric(10, 2), nullable=False)
+    documented  = Column(Boolean, default=True)
+    proof_url   = Column(Text, nullable=True)
 
     invoice = relationship("Invoice", back_populates="line_items")
 
 
 class Payment(Base):
-    """Payment records against invoices."""
     __tablename__ = "payments"
 
-    payment_id    = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    invoice_id    = Column(UUID(as_uuid=True), ForeignKey("invoices.invoice_id"), nullable=False)
-    load_id       = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=True)
-    carrier_id    = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
-
-    amount        = Column(Numeric(10, 2), nullable=False)
-    payment_method = Column(String(30), nullable=True)  # ach | check | wire | quickpay
-    reference     = Column(String(200), nullable=True)   # check number, ACH trace ID
-
-    payment_date  = Column(Date, nullable=True)
-    received_at   = Column(DateTime(timezone=True), nullable=True)
-
-    status        = Column(String(20), default="RECEIVED")  # RECEIVED | VERIFIED | REFUNDED
-    notes         = Column(Text, nullable=True)
-
-    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    payment_id     = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    invoice_id     = Column(UUID(as_uuid=True), ForeignKey("invoices.invoice_id"), nullable=False)
+    load_id        = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=True)
+    carrier_id     = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=True)
+    amount         = Column(Numeric(10, 2), nullable=False)
+    payment_method = Column(String(30), nullable=True)
+    reference      = Column(String(200), nullable=True)
+    payment_date   = Column(Date, nullable=True)
+    received_at    = Column(DateTime(timezone=True), nullable=True)
+    status         = Column(String(20), default="RECEIVED")
+    notes          = Column(Text, nullable=True)
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
 
     invoice = relationship("Invoice", back_populates="payments")
 
-    __table_args__ = (
-        Index("idx_payment_invoice", "invoice_id"),
-    )
+    __table_args__ = (Index("idx_payment_invoice", "invoice_id"),)
 
 
 class DriverSettlement(Base):
-    """Driver/carrier settlement calculations."""
     __tablename__ = "driver_settlements"
 
     settlement_id     = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     load_id           = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
     carrier_id        = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=False)
     invoice_id        = Column(UUID(as_uuid=True), ForeignKey("invoices.invoice_id"), nullable=True)
-
-    # Calculation inputs
     gross_revenue     = Column(Numeric(10, 2), nullable=False)
     dispatch_fee      = Column(Numeric(8, 2), nullable=False)
-    fuel_advance_deduction = Column(Numeric(8, 2), default=0)
+    fuel_advance_deduction   = Column(Numeric(8, 2), default=0)
     lumper_advance_deduction = Column(Numeric(7, 2), default=0)
     repair_advance_deduction = Column(Numeric(7, 2), default=0)
     other_deductions  = Column(Numeric(7, 2), default=0)
     total_deductions  = Column(Numeric(10, 2), nullable=False)
     net_settlement    = Column(Numeric(10, 2), nullable=False)
-
-    # Payment
-    payment_method    = Column(String(30), nullable=True)   # stripe | dwolla | check
+    payment_method    = Column(String(30), nullable=True)
     stripe_transfer_id = Column(String(100), nullable=True)
     bank_last4        = Column(String(4), nullable=True)
-
     status            = Column(String(20), default="CALCULATED")
-    # CALCULATED | APPROVED | PAID | FAILED | HELD
-
     settlement_pdf_url = Column(Text, nullable=True)
-
-    calculated_at = Column(DateTime(timezone=True), server_default=func.now())
-    approved_at   = Column(DateTime(timezone=True), nullable=True)
-    paid_at       = Column(DateTime(timezone=True), nullable=True)
-    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    calculated_at     = Column(DateTime(timezone=True), server_default=func.now())
+    approved_at       = Column(DateTime(timezone=True), nullable=True)
+    paid_at           = Column(DateTime(timezone=True), nullable=True)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
 
     carrier = relationship("Carrier", back_populates="settlements")
 
     __table_args__ = (
-        Index("idx_settlement_load", "load_id"),
+        Index("idx_settlement_load",    "load_id"),
         Index("idx_settlement_carrier", "carrier_id"),
-        Index("idx_settlement_status", "status"),
+        Index("idx_settlement_status",  "status"),
     )
 
 
 class DriverAdvance(Base):
-    """Fuel/cash advances issued to drivers."""
     __tablename__ = "driver_advances"
 
     advance_id      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     carrier_id      = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=False)
     load_id         = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=True)
-
     advance_type    = Column(String(20), nullable=False)
-    # fuel | lumper | repair | emergency | toll
-
     amount          = Column(Numeric(8, 2), nullable=False)
-    network         = Column(String(20), nullable=True)   # efs | comdata
-    check_code      = Column(String(50), nullable=True)   # EFS/Comdata code
+    network         = Column(String(20), nullable=True)
+    check_code      = Column(String(50), nullable=True)
     code_expires_at = Column(DateTime(timezone=True), nullable=True)
-
     status          = Column(String(20), default="ISSUED")
-    # ISSUED | REDEEMED | EXPIRED | SETTLED | CANCELLED
-
     reason          = Column(String(200), nullable=True)
     redeemed_at     = Column(DateTime(timezone=True), nullable=True)
     settlement_deducted = Column(Boolean, default=False)
     settlement_id   = Column(UUID(as_uuid=True), ForeignKey("driver_settlements.settlement_id"), nullable=True)
-
     issued_at       = Column(DateTime(timezone=True), server_default=func.now())
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -671,64 +631,58 @@ class DriverAdvance(Base):
 
     __table_args__ = (
         Index("idx_advance_carrier", "carrier_id"),
-        Index("idx_advance_load", "load_id"),
-        Index("idx_advance_status", "status"),
+        Index("idx_advance_load",    "load_id"),
+        Index("idx_advance_status",  "status"),
     )
 
 
 class WeatherAlert(Base):
-    """Weather events logged along a load's route."""
     __tablename__ = "weather_alerts"
 
-    alert_id     = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    load_id      = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
-
-    severity     = Column(String(20), nullable=False)  # WATCH | WARNING | CRITICAL | EMERGENCY
-    alert_type   = Column(String(100), nullable=True)  # "Winter Storm Warning", etc.
-    description  = Column(Text, nullable=True)
-    affected_area = Column(String(200), nullable=True)  # Counties affected
-    route_segment = Column(String(200), nullable=True)  # Where on route
-
-    start_time   = Column(DateTime(timezone=True), nullable=True)
-    end_time     = Column(DateTime(timezone=True), nullable=True)
-    driver_impact = Column(Text, nullable=True)  # Assessment narrative
-
-    driver_alerted = Column(Boolean, default=False)
+    alert_id      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    load_id       = Column(UUID(as_uuid=True), ForeignKey("loads.load_id"), nullable=False)
+    severity      = Column(String(20), nullable=False)
+    alert_type    = Column(String(100), nullable=True)
+    description   = Column(Text, nullable=True)
+    affected_area = Column(String(200), nullable=True)
+    route_segment = Column(String(200), nullable=True)
+    start_time    = Column(DateTime(timezone=True), nullable=True)
+    end_time      = Column(DateTime(timezone=True), nullable=True)
+    driver_impact = Column(Text, nullable=True)
+    driver_alerted    = Column(Boolean, default=False)
     driver_alerted_at = Column(DateTime(timezone=True), nullable=True)
-    broker_notified = Column(Boolean, default=False)
+    broker_notified   = Column(Boolean, default=False)
     broker_notified_at = Column(DateTime(timezone=True), nullable=True)
-    action_taken = Column(String(50), nullable=True)
-    # logged_only | driver_alerted | rerouted | load_held
-
+    action_taken      = Column(String(50), nullable=True)
     force_majeure_documented = Column(Boolean, default=False)
     documentation_url = Column(Text, nullable=True)
-
-    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
 
     load = relationship("Load", back_populates="weather_alerts")
 
     __table_args__ = (
-        Index("idx_weather_load", "load_id"),
+        Index("idx_weather_load",     "load_id"),
         Index("idx_weather_severity", "severity"),
     )
 
 
 class QuickbooksSyncLog(Base):
-    """QuickBooks Online sync event log."""
     __tablename__ = "quickbooks_sync_log"
 
-    sync_id       = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    entity_type   = Column(String(30), nullable=False)   # invoice | payment | expense | settlement
-    entity_id     = Column(UUID(as_uuid=True), nullable=False)
-    qbo_entity_type = Column(String(30), nullable=True)  # Invoice | Payment | Bill | etc.
-    qbo_entity_id  = Column(String(50), nullable=True)   # QBO entity ID after creation
-    event_type    = Column(String(30), nullable=False)   # CREATE | UPDATE | SYNC_CHECK
-    status        = Column(String(20), default="PENDING") # PENDING | SUCCESS | FAILED | SKIPPED
-    error_message = Column(Text, nullable=True)
-    synced_at     = Column(DateTime(timezone=True), nullable=True)
-    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    sync_id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    entity_type     = Column(String(30), nullable=False)
+    entity_id       = Column(UUID(as_uuid=True), nullable=False)
+    qbo_entity_type = Column(String(30), nullable=True)
+    qbo_entity_id   = Column(String(50), nullable=True)
+    event_type      = Column(String(30), nullable=False)
+    status          = Column(String(20), default="PENDING")
+    error_message   = Column(Text, nullable=True)
+    synced_at       = Column(DateTime(timezone=True), nullable=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         Index("idx_qb_entity", "entity_type", "entity_id"),
         Index("idx_qb_status", "status"),
     )
+
+from cortexbot.db.score_models import BrokerScore, CarrierScore

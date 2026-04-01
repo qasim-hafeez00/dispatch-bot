@@ -221,8 +221,8 @@ def _add_column_if_missing(table: str, column: sa.Column):
 
     try:
         existing_cols = {c["name"] for c in inspector.get_columns(table)}
-    except Exception:
-        # Table doesn't exist yet — let add_column create it (or fail properly)
+    except sa.exc.NoSuchTableError:
+        # Table doesn't exist yet — let add_column fail properly
         existing_cols = set()
 
     if column.name in existing_cols:

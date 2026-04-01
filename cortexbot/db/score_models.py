@@ -3,7 +3,7 @@ cortexbot/db/score_models.py — PHASE 3A NEW FILE
 
 PHASE 3A FIX (GAP-10):
 Fix: Define BrokerScore and CarrierScore as proper SQLAlchemy ORM
-models here. Import them from cortexbot.db.models.
+models here. Import them from cortexbot.db.
 """
 
 import uuid

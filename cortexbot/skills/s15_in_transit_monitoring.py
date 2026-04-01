@@ -1,11 +1,18 @@
 """
-cortexbot/skills/s15_in_transit_monitoring.py
+cortexbot/skills/s15_in_transit_monitoring.py — PHASE 3A FIXED
 
-Skill 15 — In-Transit Monitoring & Exception Handling
+PHASE 3A FIXES (GAP-05 + GAP-02):
 
-GPS loop runs every 15 minutes while a load is dispatched.
-Sends check-call prompts to driver, detects delays,
-notifies broker proactively, handles breakdowns.
+GAP-05: orchestrator.py imports run_transit_loop which didn't exist.
+  Added run_transit_loop(state) — a polling loop that calls
+  skill_15_in_transit_monitoring every GPS_POLL_INTERVAL_SECONDS seconds
+  until the load is delivered or the loop is cancelled.
+
+GAP-02: main.py's /internal/transit-monitor route calls
+  skill_15_gps_check(load_id) which didn't exist.
+  Added skill_15_gps_check(load_id) — a one-shot wrapper that loads
+  state from Redis and runs a single monitoring tick, used by the
+  BullMQ worker on its 15-minute schedule.
 """
 
 import asyncio
@@ -22,9 +29,13 @@ from cortexbot.integrations.sendgrid_client import send_email
 
 logger = logging.getLogger("cortexbot.skills.s15")
 
-CHECK_CALL_INTERVAL_MINUTES = 120  # Every 2 hours
-GPS_POLL_INTERVAL_SECONDS   = 900  # Every 15 minutes
+CHECK_CALL_INTERVAL_MINUTES = 120   # Every 2 hours
+GPS_POLL_INTERVAL_SECONDS   = 900   # Every 15 minutes
 
+
+# ─────────────────────────────────────────────────────────────
+# PUBLIC ENTRY POINTS
+# ─────────────────────────────────────────────────────────────
 
 async def skill_15_in_transit_monitoring(state: dict) -> dict:
     """
@@ -39,7 +50,6 @@ async def skill_15_in_transit_monitoring(state: dict) -> dict:
 
     logger.info(f"🗺️ [S15] Transit check for load {load_id}")
 
-    # Get GPS position
     gps = await _get_gps_position(carrier_id)
 
     if not gps:
@@ -47,24 +57,20 @@ async def skill_15_in_transit_monitoring(state: dict) -> dict:
         await _send_check_call_prompt(carrier_wa, tms_ref)
         return {**state, "gps_status": "NO_SIGNAL", "last_check_call_sent": True}
 
-    # Calculate ETA to next stop
     next_stop = _get_next_stop(state)
     eta_info  = await _calculate_eta(gps, next_stop) if next_stop else None
 
-    # Milestone logging
     milestone = _detect_milestone(gps, state)
     if milestone:
         await _log_milestone(load_id, milestone, gps)
         await _send_broker_milestone(state, milestone, gps, broker_email)
 
-    # Delay detection
     delay_hours = 0.0
-    if eta_info and next_stop.get("appointment_time"):
+    if eta_info and next_stop and next_stop.get("appointment_time"):
         delay_hours = _check_for_delay(eta_info, next_stop)
         if delay_hours > 0.5:
             await _handle_delay(state, delay_hours, eta_info, broker_email, carrier_wa)
 
-    # Scheduled check-call
     if _is_check_call_due(state):
         await _send_check_call_prompt(carrier_wa, tms_ref)
 
@@ -78,6 +84,77 @@ async def skill_15_in_transit_monitoring(state: dict) -> dict:
     }
 
 
+async def skill_15_gps_check(load_id: str) -> dict:
+    """
+    GAP-02 FIX: One-shot wrapper called by BullMQ worker via
+    POST /internal/transit-monitor every 15 minutes.
+
+    Loads current state from Redis, runs one monitoring tick,
+    persists updated state back to Redis.
+    Returns the updated state dict (or an error dict).
+    """
+    from cortexbot.core.redis_client import get_state, set_state
+
+    state = await get_state(f"cortex:state:load:{load_id}")
+    if not state:
+        logger.warning(f"[S15] skill_15_gps_check: no state for load {load_id}")
+        return {"error": f"No state found for load {load_id}"}
+
+    # Don't run if load is already delivered / settled
+    terminal = {"DELIVERED", "INVOICED", "PAID", "SETTLED", "FAILED"}
+    if state.get("status") in terminal:
+        logger.debug(f"[S15] Load {load_id} is in terminal state {state['status']} — skipping GPS check")
+        return {"load_id": load_id, "skipped": True, "reason": state["status"]}
+
+    updated = await skill_15_in_transit_monitoring(state)
+    await set_state(f"cortex:state:load:{load_id}", updated)
+    return updated
+
+
+async def run_transit_loop(state: dict):
+    """
+    GAP-05 FIX: Background polling loop imported by orchestrator.py.
+
+    Runs skill_15_in_transit_monitoring every GPS_POLL_INTERVAL_SECONDS
+    until the load reaches a terminal status or the task is cancelled.
+    State is refreshed from Redis on each tick so concurrent updates
+    (e.g. driver WhatsApp messages) are visible to the loop.
+    """
+    from cortexbot.core.redis_client import get_state, set_state
+
+    load_id = state["load_id"]
+    logger.info(f"🔄 [S15] Transit loop started for load {load_id}")
+
+    terminal = {"DELIVERED", "INVOICED", "PAID", "SETTLED", "FAILED", "TONU"}
+
+    while True:
+        try:
+            # Always reload fresh state from Redis
+            current = await get_state(f"cortex:state:load:{load_id}") or state
+
+            if current.get("status") in terminal:
+                logger.info(f"[S15] Transit loop ending: load {load_id} reached {current['status']}")
+                break
+
+            updated = await skill_15_in_transit_monitoring(current)
+            await set_state(f"cortex:state:load:{load_id}", updated)
+
+            # Check if delivered flag was set during this tick
+            if updated.get("delivered") or updated.get("status") in terminal:
+                logger.info(f"[S15] Transit loop: delivery confirmed for {load_id}")
+                break
+
+        except asyncio.CancelledError:
+            logger.info(f"[S15] Transit loop cancelled for load {load_id}")
+            break
+        except Exception as e:
+            logger.error(f"[S15] Transit loop error for load {load_id}: {e}", exc_info=True)
+
+        await asyncio.sleep(GPS_POLL_INTERVAL_SECONDS)
+
+    logger.info(f"✅ [S15] Transit loop exited for load {load_id}")
+
+
 async def confirm_delivery(load_id: str, state: dict) -> dict:
     """
     Driver confirms delivery complete.
@@ -87,7 +164,6 @@ async def confirm_delivery(load_id: str, state: dict) -> dict:
 
     logger.info(f"✅ [S15] Delivery confirmed for load {load_id}")
 
-    # Request POD documents immediately
     if carrier_wa:
         await send_whatsapp(
             carrier_wa,
@@ -99,7 +175,6 @@ async def confirm_delivery(load_id: str, state: dict) -> dict:
             "Send photos NOW — don't wait! 📸"
         )
 
-    # Update DB
     async with get_db_session() as db:
         from sqlalchemy import update as sa_update
         await db.execute(
@@ -116,7 +191,7 @@ async def confirm_delivery(load_id: str, state: dict) -> dict:
             new_status="DELIVERED",
         ))
 
-    return {**state, "status": "DELIVERED"}
+    return {**state, "status": "DELIVERED", "delivered": True}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -128,11 +203,11 @@ async def _get_gps_position(carrier_id: str) -> Optional[dict]:
     try:
         result = await api_call(
             "samsara_eld",
-            f"/fleet/vehicles/stats/feed",
+            "/fleet/vehicles/stats/feed",
             method="GET",
             params={"types": "gps", "tagIds": carrier_id},
             cache_key=f"gps-{carrier_id}",
-            cache_category="gps",
+            cache_category="gps_position",
         )
         data = result.get("data", [{}])
         if data:
@@ -176,8 +251,8 @@ async def _calculate_eta(gps: dict, next_stop: dict) -> Optional[dict]:
         eta_dt  = datetime.now(timezone.utc) + timedelta(seconds=seconds)
 
         return {
-            "eta_utc":       eta_dt.isoformat(),
-            "minutes_away":  int(seconds / 60),
+            "eta_utc":         eta_dt.isoformat(),
+            "minutes_away":    int(seconds / 60),
             "miles_remaining": miles,
         }
     except Exception:
@@ -189,13 +264,9 @@ async def _calculate_eta(gps: dict, next_stop: dict) -> Optional[dict]:
 # ─────────────────────────────────────────────────────────────
 
 def _detect_milestone(gps: dict, state: dict) -> Optional[str]:
-    """Simple geo-proximity milestone detection."""
     if not gps.get("latitude"):
         return None
-
-    # In production: compare against geo-fence radius around pickup/delivery
-    # For now: rely on driver WhatsApp messages for milestones
-    return None
+    return None  # Geo-fence events are handled by eld_webhooks.py
 
 
 async def _log_milestone(load_id: str, milestone: str, gps: dict):
@@ -210,12 +281,10 @@ async def _log_milestone(load_id: str, milestone: str, gps: dict):
 
 
 async def _send_broker_milestone(state: dict, milestone: str, gps: dict, broker_email: str):
-    """Send proactive status update to broker at key milestones."""
     if not broker_email:
         return
 
     tms_ref     = state.get("tms_ref", state["load_id"])
-    dest_city   = state.get("destination_city", "destination")
     driver_name = state.get("carrier_owner_name", "Driver").split()[0]
 
     messages = {
@@ -223,7 +292,6 @@ async def _send_broker_milestone(state: dict, milestone: str, gps: dict, broker_
         "DRIVER_ARRIVED_DEL": f"Driver {driver_name} has arrived at delivery for load {tms_ref}. Unloading in progress.",
         "DRIVER_DELIVERED":   f"Load {tms_ref} delivered. POD collection in progress.",
     }
-
     msg = messages.get(milestone)
     if msg:
         await send_email(
@@ -238,17 +306,16 @@ async def _send_broker_milestone(state: dict, milestone: str, gps: dict, broker_
 # ─────────────────────────────────────────────────────────────
 
 def _get_next_stop(state: dict) -> Optional[dict]:
-    """Return the next stop the driver needs to reach."""
     load_status = state.get("status", "")
     if load_status in ("DISPATCHED", "IN_TRANSIT"):
         return {
-            "address":          state.get("origin_city", "") + ", " + state.get("origin_state", ""),
+            "address":          f"{state.get('origin_city', '')}, {state.get('origin_state', '')}",
             "appointment_time": state.get("pickup_appt_time"),
             "type":             "pickup",
         }
     elif load_status == "LOADED":
         return {
-            "address":          state.get("destination_city", "") + ", " + state.get("destination_state", ""),
+            "address":          f"{state.get('destination_city', '')}, {state.get('destination_state', '')}",
             "appointment_time": state.get("delivery_appt_time"),
             "type":             "delivery",
         }
@@ -256,7 +323,6 @@ def _get_next_stop(state: dict) -> Optional[dict]:
 
 
 def _check_for_delay(eta_info: dict, stop: dict) -> float:
-    """Returns hours of delay if ETA exceeds appointment. 0 if on time."""
     appt_str = stop.get("appointment_time")
     eta_str  = eta_info.get("eta_utc")
     if not appt_str or not eta_str:
@@ -273,7 +339,6 @@ def _check_for_delay(eta_info: dict, stop: dict) -> float:
 
 async def _handle_delay(state: dict, delay_hours: float, eta_info: dict,
                         broker_email: str, carrier_wa: str):
-    """Notify broker of anticipated delay."""
     tms_ref  = state.get("tms_ref", state["load_id"])
     stop     = _get_next_stop(state)
     stop_type = stop.get("type", "stop") if stop else "stop"
@@ -309,11 +374,9 @@ async def _handle_delay(state: dict, delay_hours: float, eta_info: dict,
 # ─────────────────────────────────────────────────────────────
 
 def _is_check_call_due(state: dict) -> bool:
-    """Returns True if it's time for a scheduled check-call."""
     last_call = state.get("last_check_call_sent_at")
     if not last_call:
         return True
-
     try:
         last_dt = datetime.fromisoformat(last_call)
         return (datetime.now(timezone.utc) - last_dt).total_seconds() > CHECK_CALL_INTERVAL_MINUTES * 60
@@ -322,7 +385,6 @@ def _is_check_call_due(state: dict) -> bool:
 
 
 async def _send_check_call_prompt(carrier_wa: str, tms_ref: str):
-    """Send automated check-in prompt to driver."""
     if not carrier_wa:
         return
     await send_whatsapp(

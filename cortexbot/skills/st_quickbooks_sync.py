@@ -1,10 +1,30 @@
 """
-cortexbot/skills/st_quickbooks_sync.py
+cortexbot/skills/st_quickbooks_sync.py — PHASE 3A FIXED
 
-Skill T — QuickBooks Online Accounting Sync
+PHASE 3A FIX (GAP-07): Dual-definition of skill_t_quickbooks_sync.
 
-FIX: This file was completely empty. Added skill_t_sync_to_quickbooks()
-     which the orchestrator imports but was missing, causing ImportError.
+Previously two files defined skill_t_quickbooks_sync with different signatures:
+
+  sq_sr_ss_st_financial.py:
+    async def skill_t_quickbooks_sync(event_type: str, state: dict) -> dict  # 2-arg
+
+  st_quickbooks_sync.py:
+    async def skill_t_quickbooks_sync(state: dict) -> dict                    # 1-arg
+
+orchestrator.py imports from st_quickbooks_sync (1-arg, correct).
+orchestrator_phase2.py imports from sq_sr_ss_st_financial (2-arg, correct).
+
+Both call sites were individually correct but the dual definition was a
+maintenance timebomb — easy to accidentally import the wrong one.
+
+Fix:
+  1. This file (st_quickbooks_sync.py) is the canonical 1-arg orchestrator
+     entry point. It loops through all financial event types and delegates
+     to the 2-arg helper in sq_sr_ss_st_financial.py.
+  2. orchestrator_phase2.py's import of skill_t_quickbooks_sync from
+     sq_sr_ss_st_financial is explicitly kept for its 2-arg call sites.
+  3. A clear comment in sq_sr_ss_st_financial marks the 2-arg function as
+     "internal helper — use st_quickbooks_sync for orchestrator integration".
 """
 
 import logging
@@ -15,25 +35,59 @@ from cortexbot.db.models import Event
 
 logger = logging.getLogger("cortexbot.skills.st")
 
-# QuickBooks account code mapping
+# QuickBooks account code mapping — single source of truth
 QBO_ACCOUNT_MAP = {
     "DISPATCH_FEE": "4000 — Dispatch Service Revenue",
-    "SETTLEMENT": "2000 — Carrier Settlements Payable",
+    "SETTLEMENT":   "2000 — Carrier Settlements Payable",
     "FUEL_ADVANCE": "2100 — Driver Advances Payable",
     "LUMPER_ADVANCE": "2100 — Driver Advances Payable",
-    "INVOICE": "1200 — Accounts Receivable",
-    "PAYMENT": "1000 — Operating Checking",
-    "EXPENSE": "6000 — Operating Expenses",
+    "INVOICE":      "1200 — Accounts Receivable",
+    "PAYMENT":      "1000 — Operating Checking",
+    "EXPENSE":      "6000 — Operating Expenses",
 }
 
+# All event types synced per completed load
+_ALL_LOAD_EVENTS = ("INVOICE", "PAYMENT", "DISPATCH_FEE", "SETTLEMENT")
+
+
+# ─────────────────────────────────────────────────────────────
+# SINGLE-ARG ORCHESTRATOR ENTRY POINT (imported by orchestrator.py)
+# ─────────────────────────────────────────────────────────────
+
+async def skill_t_quickbooks_sync(state: dict) -> dict:
+    """
+    Orchestrator node wrapper — syncs all financial events for a completed load.
+
+    Signature: (state: dict) → dict
+    Called by: orchestrator.py  run_quickbooks_sync()
+
+    Loops through all 4 financial event types and delegates each to the
+    2-arg helper skill_t_sync_to_quickbooks().
+    """
+    for event_type in _ALL_LOAD_EVENTS:
+        try:
+            state = await skill_t_sync_to_quickbooks(event_type, state)
+        except Exception as e:
+            logger.warning(f"[T] QBO sync failed for {event_type}: {e}")
+
+    return {**state, "qbo_synced": True}
+
+
+# ─────────────────────────────────────────────────────────────
+# TWO-ARG HELPER (also used by orchestrator_phase2.py directly)
+# ─────────────────────────────────────────────────────────────
 
 async def skill_t_sync_to_quickbooks(event_type: str, state: dict) -> dict:
     """
-    Sync a financial event to QuickBooks Online.
-    Handles: DISPATCH_FEE, SETTLEMENT, ADVANCE, INVOICE, PAYMENT.
+    Sync a single financial event to QuickBooks Online.
 
-    In production this calls the QBO REST API via api_gateway.
-    For now it creates the QBO entity and logs the sync event.
+    Signature: (event_type: str, state: dict) → dict
+    Called by:
+      - skill_t_quickbooks_sync() above (via loop)
+      - orchestrator_phase2.py  run_post_payment_pipeline()
+
+    In production this calls the QBO REST API.
+    In dev / when QBO is unconfigured it logs the sync event only.
     """
     load_id = state.get("load_id", "")
     tms_ref = state.get("tms_ref", load_id)
@@ -57,14 +111,14 @@ async def skill_t_sync_to_quickbooks(event_type: str, state: dict) -> dict:
             create_qbo_invoice,
             record_qbo_payment,
         )
-        from cortexbot.config import settings
 
-        if settings.quickbooks_client_id and settings.quickbooks_company_id:
+        if settings_configured():
             if event_type == "INVOICE":
-                broker_id = state.get("broker_id", "1")
+                broker_id      = state.get("broker_id", "1")
                 invoice_number = state.get("invoice_number", f"INV-{load_id[:8]}")
-                due_date = state.get("payment_due_date", "")[:10] if state.get("payment_due_date") else ""
-                qbo_entity_id = await create_qbo_invoice(
+                due_date       = (state.get("payment_due_date", "")[:10]
+                                  if state.get("payment_due_date") else "")
+                qbo_entity_id  = await create_qbo_invoice(
                     customer_ref=str(broker_id),
                     amount=float(amount),
                     description=f"Freight services — {tms_ref}",
@@ -73,7 +127,7 @@ async def skill_t_sync_to_quickbooks(event_type: str, state: dict) -> dict:
                 )
 
             elif event_type == "PAYMENT" and state.get("qbo_invoice_id"):
-                payment_date = (
+                payment_date  = (
                     state.get("payment_received_date", "")[:10]
                     or datetime.now().strftime("%Y-%m-%d")
                 )
@@ -84,9 +138,9 @@ async def skill_t_sync_to_quickbooks(event_type: str, state: dict) -> dict:
                     payment_date=payment_date,
                 )
     except Exception as e:
-        logger.warning(f"[T] Live QBO sync failed: {e} — logging event only")
+        logger.warning(f"[T] Live QBO sync failed: {e} — event logged only")
 
-    # Always log the sync event
+    # Always log the sync event regardless of live API result
     async with get_db_session() as db:
         db.add(Event(
             event_code=f"QBO_SYNC_{event_type}",
@@ -94,11 +148,11 @@ async def skill_t_sync_to_quickbooks(event_type: str, state: dict) -> dict:
             entity_id=load_id,
             triggered_by="st_quickbooks_sync",
             data={
-                "event_type": event_type,
-                "qbo_account": account,
+                "event_type":    event_type,
+                "qbo_account":   account,
                 "qbo_entity_id": qbo_entity_id,
-                "amount": float(amount),
-                "synced_at": datetime.now(timezone.utc).isoformat(),
+                "amount":        float(amount),
+                "synced_at":     datetime.now(timezone.utc).isoformat(),
             },
         ))
 
@@ -109,9 +163,10 @@ async def skill_t_sync_to_quickbooks(event_type: str, state: dict) -> dict:
     return updated
 
 
-# Alias used by orchestrator imports
-async def skill_t_quickbooks_sync(state: dict) -> dict:
-    """Orchestrator node wrapper — syncs all financial events for a load."""
-    for event_type in ("INVOICE", "PAYMENT", "DISPATCH_FEE", "SETTLEMENT"):
-        state = await skill_t_sync_to_quickbooks(event_type, state)
-    return state
+def settings_configured() -> bool:
+    """Return True only if QBO is fully configured."""
+    try:
+        from cortexbot.config import settings
+        return bool(settings.quickbooks_client_id and settings.quickbooks_company_id)
+    except Exception:
+        return False

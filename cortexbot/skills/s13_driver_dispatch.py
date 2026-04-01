@@ -90,19 +90,23 @@ async def skill_13_driver_dispatch(state: dict) -> dict:
     # ── 4. Persist DISPATCHED status ──────────────────────────
     async with get_db_session() as db:
         from sqlalchemy import update as sa_update
+        
+        update_vals = {
+            "status": "DISPATCHED",
+            "dispatched_at": datetime.now(timezone.utc),
+        }
+        
+        # COPILOT FIX: persist driver_phone so downstream skills
+        # (s15, s19, s27) can reach the driver without re-querying
+        # the carrier. Prefer driver_phone; fall back to carrier_phone.
+        driver_phone = state.get("driver_phone") or state.get("carrier_phone")
+        if driver_phone:
+            update_vals["driver_phone"] = driver_phone
+
         await db.execute(
             sa_update(Load)
             .where(Load.load_id == load_id)
-            .values(
-                status="DISPATCHED",
-                dispatched_at=datetime.now(timezone.utc),
-                # COPILOT FIX: persist driver_phone so downstream skills
-                # (s15, s19, s27) can reach the driver without re-querying
-                # the carrier. Prefer driver_phone; fall back to carrier_phone.
-                driver_phone=(
-                    state.get("driver_phone") or state.get("carrier_phone")
-                ),
-            )
+            .values(**update_vals)
         )
         db.add(Event(
             event_code="LOAD_DISPATCHED",

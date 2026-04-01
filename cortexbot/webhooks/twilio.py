@@ -75,7 +75,7 @@ async def _is_duplicate_message(phone: str, body: str) -> bool:
         # non-atomic SETNX + EXPIRE pair.  If the process crashes between
         # the two calls the key would never expire → message permanently
         # deduplicated.  SET NX EX is atomic on all Redis versions ≥ 2.6.
-        set_result = await r.set(key, "1", nx=True, ex=90)
+        set_result = await r.set(key, "1", nx=True, ex=60)
         is_new = set_result is not None   # None → key already existed
         return not is_new                 # True = duplicate, False = new
 

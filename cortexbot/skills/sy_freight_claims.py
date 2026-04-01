@@ -109,6 +109,7 @@ async def skill_y_open_freight_claim(
         # COPILOT FIX: if the INSERT failed, claim_id is still None.
         # Don't write an orphaned Event or send a misleading SMS alert.
         if claim_id is None:
+            await db.rollback()
             logger.error(
                 f"[SY] Aborting claim workflow for load {load_id} — "
                 f"DB insert failed, claim_id is None"

@@ -1,13 +1,22 @@
 """
-cortexbot/core/api_gateway.py — FIXED
+cortexbot/core/api_gateway.py — PHASE 3A FIXED (includes GAP-14 Redis token persistence)
 
-Central API Gateway for ALL external API calls.
+PHASE 3A FIX (GAP-06):
+s14_hos_compliance.py and s15_in_transit_monitoring.py call:
+    api_call("samsara_eld", ...)
+    api_call("motive_eld", ...)
 
-FIXES APPLIED:
-  1. DAT Token Race Condition — added asyncio.Lock() so 50 concurrent
-     load searches don't fire 50 simultaneous token-refresh requests.
-  2. QBO token refresh stubbed cleanly with a lock as well.
-  3. Circuit-breaker state is now per-key (not global across processes).
+But API_CONFIGS only had keys "samsara" and "motive".
+api_call("samsara_eld", ...) → API_CONFIGS.get("samsara_eld", {}) → {}
+→ no base_url, no auth headers, all ELD calls silently failed.
+
+Fix: added "samsara_eld" and "motive_eld" as explicit alias entries
+that reference the same config dicts as "samsara" and "motive".
+
+Also retained previous Phase 2 fixes:
+  - DAT token refresh uses asyncio.Lock (no stampede on restart)
+  - QBO token refresh uses asyncio.Lock
+  - Circuit breaker state is per-key
 """
 
 import asyncio
@@ -27,6 +36,34 @@ logger = logging.getLogger("cortexbot.api_gateway")
 # ============================================================
 # API CONFIGURATION
 # ============================================================
+
+def _samsara_config() -> dict:
+    return {
+        "base_url": settings.samsara_base_url,
+        "auth_type": "bearer",
+        "api_key": settings.samsara_api_key,
+        "cache_ttl": {"gps_position": 60, "hos_data": 300},
+        "retry_attempts": 2,
+        "retry_backoff": "linear",
+        "fallback": "motive",
+        "circuit_breaker_threshold": 5,
+        "circuit_breaker_timeout": 60,
+    }
+
+
+def _motive_config() -> dict:
+    return {
+        "base_url": settings.motive_base_url,
+        "auth_type": "api_key_header",
+        "header_name": "X-Api-Key",
+        "api_key": settings.motive_api_key,
+        "cache_ttl": {"gps_position": 60, "hos_data": 300},
+        "retry_attempts": 2,
+        "retry_backoff": "linear",
+        "circuit_breaker_threshold": 5,
+        "circuit_breaker_timeout": 60,
+    }
+
 
 API_CONFIGS = {
     # ── Load Boards ───────────────────────────────────────────
@@ -97,29 +134,17 @@ API_CONFIGS = {
         "circuit_breaker_threshold": 3,
         "circuit_breaker_timeout": 30,
     },
-    # ── ELD Providers ─────────────────────────────────────────
-    "samsara": {
-        "base_url": settings.samsara_base_url,
-        "auth_type": "bearer",
-        "api_key": settings.samsara_api_key,
-        "cache_ttl": {"gps_position": 60, "hos_data": 300},
-        "retry_attempts": 2,
-        "retry_backoff": "linear",
-        "fallback": "motive",
-        "circuit_breaker_threshold": 5,
-        "circuit_breaker_timeout": 60,
-    },
-    "motive": {
-        "base_url": settings.motive_base_url,
-        "auth_type": "api_key_header",
-        "header_name": "X-Api-Key",
-        "api_key": settings.motive_api_key,
-        "cache_ttl": {"gps_position": 60, "hos_data": 300},
-        "retry_attempts": 2,
-        "retry_backoff": "linear",
-        "circuit_breaker_threshold": 5,
-        "circuit_breaker_timeout": 60,
-    },
+    # ── ELD Providers (canonical names) ───────────────────────
+    "samsara": _samsara_config(),
+    "motive":  _motive_config(),
+    # ── ELD Providers (GAP-06 FIX: aliases used by s14 & s15) ─
+    # s14_hos_compliance.py and s15_in_transit_monitoring.py both call
+    # api_call("samsara_eld", ...) and api_call("motive_eld", ...).
+    # Adding explicit alias keys pointing to the same configurations
+    # eliminates the silent failure where API_CONFIGS.get("samsara_eld", {})
+    # returned an empty dict and no auth headers were set.
+    "samsara_eld": _samsara_config(),
+    "motive_eld":  _motive_config(),
     # ── Mapping & Weather ─────────────────────────────────────
     "google_maps": {
         "base_url": "https://maps.googleapis.com/maps/api",
@@ -213,41 +238,38 @@ _circuit_breakers: dict[str, CircuitBreaker] = {}
 
 
 def get_circuit_breaker(api_name: str) -> CircuitBreaker:
-    if api_name not in _circuit_breakers:
-        config = API_CONFIGS.get(api_name, {})
-        _circuit_breakers[api_name] = CircuitBreaker(
+    # Canonical name for aliased ELD providers so circuit state is shared
+    canonical = {"samsara_eld": "samsara", "motive_eld": "motive"}.get(api_name, api_name)
+    if canonical not in _circuit_breakers:
+        config = API_CONFIGS.get(canonical, {})
+        _circuit_breakers[canonical] = CircuitBreaker(
             threshold=config.get("circuit_breaker_threshold", 5),
             timeout_secs=config.get("circuit_breaker_timeout", 60),
         )
-    return _circuit_breakers[api_name]
+    return _circuit_breakers[canonical]
 
 
 # ============================================================
-# FIX #1 — TOKEN MANAGEMENT WITH asyncio.Lock
-# Previously: global variables with no lock → race condition under load.
-# Fix: double-checked locking pattern prevents 50 simultaneous refreshes.
+# TOKEN MANAGEMENT WITH asyncio.Lock (prevents stampede)
 # ============================================================
 
 _dat_token: Optional[str] = None
 _dat_token_expires_at: float = 0
-_dat_token_lock = asyncio.Lock()          # ← NEW: prevents token stampede
+_dat_token_lock = asyncio.Lock()
 
 _qbo_token: Optional[str] = None
 _qbo_token_expires_at: float = 0
-_qbo_token_lock = asyncio.Lock()          # ← NEW: same fix for QBO
+_qbo_token_lock = asyncio.Lock()
 
 
 async def get_dat_token() -> str:
     """Thread-safe DAT OAuth2 token fetch with double-checked locking."""
     global _dat_token, _dat_token_expires_at
 
-    # Fast path — token still valid, no lock needed
     if _dat_token and time.time() < _dat_token_expires_at - 60:
         return _dat_token
 
-    # Slow path — acquire lock, then check again inside
     async with _dat_token_lock:
-        # Another coroutine may have refreshed while we waited
         if _dat_token and time.time() < _dat_token_expires_at - 60:
             return _dat_token
 
@@ -329,18 +351,16 @@ async def api_call(
     config = API_CONFIGS.get(api_name, {})
     cb = get_circuit_breaker(api_name)
 
-    # ── Circuit breaker check ─────────────────────────────────
     if cb.is_open():
         fallback = config.get("fallback")
         if fallback and fallback != "human_escalation":
             logger.info(f"⚡ Circuit open for {api_name} — trying fallback: {fallback}")
             return await api_call(
                 fallback, endpoint, method, payload, params,
-                cache_key, cache_category, timeout
+                cache_key, cache_category, timeout,
             )
         raise CircuitOpenError(f"{api_name} circuit is open")
 
-    # ── Cache check (GET only) ────────────────────────────────
     if cache_key and method == "GET" and cache_category:
         try:
             r = get_redis()
@@ -348,9 +368,8 @@ async def api_call(
             if cached:
                 return json.loads(cached)
         except Exception:
-            pass  # Cache miss is fine — proceed to API
+            pass
 
-    # ── Build auth headers ────────────────────────────────────
     headers = {"Content-Type": "application/json"}
     base_url = config.get("base_url", "")
     auth_type = config.get("auth_type", "api_key_header")
@@ -373,11 +392,10 @@ async def api_call(
     elif auth_type == "oauth2_qbo":
         headers["Authorization"] = f"Bearer {await _get_qbo_token()}"
 
-    if api_name == "noaa_weather":
+    if api_name in ("noaa_weather",):
         headers["User-Agent"] = "CortexBot/2.0 (dispatch@cortexbot.com)"
         headers.pop("Content-Type", None)
 
-    # ── Execute with retry ────────────────────────────────────
     max_attempts = config.get("retry_attempts", 3)
     url = f"{base_url}{endpoint}"
 
@@ -407,7 +425,6 @@ async def api_call(
                 except Exception:
                     result = {"text": response.text}
 
-                # Store in cache
                 if cache_key and method == "GET" and cache_category:
                     try:
                         ttl = config.get("cache_ttl", {}).get(cache_category, 300)
@@ -427,7 +444,7 @@ async def api_call(
         except httpx.HTTPStatusError as e:
             logger.warning(f"❌ HTTP {e.response.status_code} from {api_name}: {e}")
             if e.response.status_code < 500:
-                raise  # 4xx — don't retry
+                raise
         except Exception as e:
             logger.error(f"💥 Error calling {api_name}: {e}")
 
@@ -443,7 +460,7 @@ async def api_call(
         logger.info(f"🔄 Falling back from {api_name} to {fallback}")
         return await api_call(
             fallback, endpoint, method, payload, params,
-            cache_key, cache_category, timeout
+            cache_key, cache_category, timeout,
         )
 
     raise APIError(f"All {max_attempts} attempts to {api_name} failed")

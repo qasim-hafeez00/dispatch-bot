@@ -141,6 +141,7 @@ async def skill_t_sync_to_quickbooks(event_type: str, state: dict) -> dict:
     logger.info(f"[T] QBO sync: {event_type} ${float(amount):.2f} | {tms_ref}")
 
     qbo_entity_id = None
+    qbo_sync_error = None
 
     # Attempt live QBO sync if configured
     try:
@@ -176,6 +177,7 @@ async def skill_t_sync_to_quickbooks(event_type: str, state: dict) -> dict:
                 )
     except Exception as e:
         logger.warning(f"[T] Live QBO sync failed: {e} — event logged only")
+        qbo_sync_error = e
 
     # Always log the sync event regardless of live API result
     async with get_db_session() as db:
@@ -192,6 +194,9 @@ async def skill_t_sync_to_quickbooks(event_type: str, state: dict) -> dict:
                 "synced_at":     datetime.now(timezone.utc).isoformat(),
             },
         ))
+
+    if qbo_sync_error:
+        raise qbo_sync_error
 
     updated = {**state, "qbo_synced": True, "qbo_event_type": event_type}
     if qbo_entity_id:

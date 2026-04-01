@@ -1,8 +1,15 @@
 """
-cortexbot/config.py — Phase 2 Complete
+cortexbot/config.py — PHASE 3A FIXED
 
-All configuration loaded from environment variables (.env.local).
-Phase 2 adds: Stripe, EFS/Comdata, QuickBooks, Highway.com, Samsara, Motive.
+PHASE 3A ADDITIONS (GAP-03):
+Added 9 missing settings that were referenced at import-time by:
+  - quickbooks_client.py  → quickbooks_realm_id, quickbooks_sandbox
+  - comdata_efs_client.py → efs_base_url (alias), efs_account_number
+  - weather_client.py     → noaa_base_url (alias)
+  - factoring_client.py   → otr_capital_*, rts_financial_*
+
+All additions use empty-string or safe defaults so the app still
+starts when these services are unconfigured.
 """
 
 from pydantic_settings import BaseSettings
@@ -89,11 +96,16 @@ class Settings(BaseSettings):
 
     # ── Stripe (Driver Settlement Payments) ───────────────────
     stripe_api_key: str = ""
+    stripe_secret_key: str = ""           # alias used by stripe_client.py
     stripe_webhook_secret: str = ""
 
-    # ── Fuel Card APIs ────────────────────────────────────────
+    # ── EFS Fuel Card ─────────────────────────────────────────
     efs_api_key: str = ""
     efs_api_base_url: str = "https://api.efspay.com/v1"
+    # GAP-03 FIX: efs_account_number and efs_base_url (alias)
+    efs_account_number: str = ""
+
+    # ── Comdata Fuel Card ─────────────────────────────────────
     comdata_api_key: str = ""
     comdata_api_base_url: str = "https://api.comdata.com/v1"
 
@@ -101,10 +113,20 @@ class Settings(BaseSettings):
     quickbooks_client_id: str = ""
     quickbooks_client_secret: str = ""
     quickbooks_company_id: str = ""
-    quickbooks_base_url: str = "https://quickbooks.api.intuit.com/v3"
+    quickbooks_base_url: str = "https://quickbooks.api.intuit.com"
+    # GAP-03 FIX: quickbooks_realm_id (alias for company_id) and sandbox flag
+    quickbooks_realm_id: str = ""         # populated from quickbooks_company_id if blank
+    quickbooks_sandbox: bool = True       # switch to False in production
 
     # ── NOAA/Weather ─────────────────────────────────────────
+    # GAP-03 FIX: provide both spellings; weather_client.py uses noaa_base_url
     noaa_api_base_url: str = "https://api.weather.gov"
+
+    # ── Factoring Companies (GAP-03 FIX) ─────────────────────
+    otr_capital_api_key: str = ""
+    otr_capital_base_url: str = "https://api.otrcapital.com/v1"
+    rts_financial_api_key: str = ""
+    rts_financial_base_url: str = "https://api.rtsinc.com/v1"
 
     # ── Escalation ────────────────────────────────────────────
     oncall_phone: str = ""
@@ -142,6 +164,8 @@ class Settings(BaseSettings):
         case_sensitive = False
         extra = "ignore"
 
+    # ── Derived / Alias Properties ────────────────────────────
+
     @property
     def is_development(self) -> bool:
         return self.environment == "development"
@@ -149,6 +173,38 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def efs_base_url(self) -> str:
+        """GAP-03 FIX: comdata_efs_client.py uses settings.efs_base_url."""
+        return self.efs_api_base_url
+
+    @property
+    def comdata_base_url(self) -> str:
+        """Alias used by comdata_efs_client.py."""
+        return self.comdata_api_base_url
+
+    @property
+    def noaa_base_url(self) -> str:
+        """GAP-03 FIX: weather_client.py uses settings.noaa_base_url."""
+        return self.noaa_api_base_url
+
+    @property
+    def effective_quickbooks_realm_id(self) -> str:
+        """
+        GAP-03 FIX: quickbooks_client.py calls settings.quickbooks_realm_id.
+        Falls back to quickbooks_company_id if the dedicated field is blank.
+        """
+        return self.quickbooks_realm_id or self.quickbooks_company_id
+
+    @property
+    def default_eld_provider(self) -> str:
+        """Return the first configured ELD provider, or 'none'."""
+        if self.samsara_api_key:
+            return "samsara"
+        if self.motive_api_key:
+            return "motive"
+        return "none"
 
     # ── Computed Webhook URLs ─────────────────────────────────
     @property

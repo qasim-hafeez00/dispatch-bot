@@ -2,7 +2,7 @@
 cortexbot/skills/s24_s25_relationship_scoring.py — PHASE 3A FIXED
 
 PHASE 3A FIX (GAP-08):
-skill_24_broker_relationship_management() used sa_text("""...""") in its
+skill_24_broker_relationship_management() used sa_text() in its
 outer function body, but sa_text was only imported inside the nested
 _calculate_broker_score() helper as a local import.
 

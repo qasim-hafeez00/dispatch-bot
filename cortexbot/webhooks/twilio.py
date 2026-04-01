@@ -114,6 +114,16 @@ async def handle_whatsapp_inbound(payload: dict):
         await _handle_media(phone, body, media_urls)
         return
 
+    # PHASE 3C — handle CC driver ping responses
+    CC_RESPONSE_KEYWORDS = {"ok", "okay", "broke", "delay", "help", "fine", "good"}
+    if any(kw in text for kw in CC_RESPONSE_KEYWORDS):
+        from cortexbot.core.redis_client import get_whatsapp_context
+        ctx     = await get_whatsapp_context(phone)
+        load_id = ctx.get("current_load_id") if ctx else None
+        if load_id:
+            from cortexbot.agents.emergency_rebroker import signal_driver_responded
+            await signal_driver_responded(load_id)
+
     # ── Load offer confirmation (Skill 09 handles this) ──────
     from cortexbot.skills.s09_carrier_confirm import handle_inbound_whatsapp
     await handle_inbound_whatsapp(phone, body, [])

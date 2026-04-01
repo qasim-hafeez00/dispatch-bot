@@ -312,6 +312,7 @@ async def run_start_transit_monitoring(state: LoadState) -> LoadState:
     asyncio.create_task(_run_transit_background(state))
     asyncio.create_task(_run_backhaul_planning(state))
     asyncio.create_task(_run_fuel_optimization(state))
+    asyncio.create_task(_watch_gps_dark(load_id, state), name=f"gps_watch_{load_id}")  # PHASE 3C ADD
 
     updated = {
         **state,
@@ -344,6 +345,109 @@ async def _run_fuel_optimization(state: dict):
         await skill_22_fuel_optimization(state)
     except Exception as e:
         logger.warning(f"Fuel optimization error: {e}")
+
+
+_GPS_DARK_THRESHOLD_SECS = 30 * 60   # 30 minutes without a GPS update
+
+
+async def _watch_gps_dark(load_id: str, state: dict):
+    """
+    Background task launched at dispatch.
+    Polls carrier GPS every 5 minutes. If no update for 30 minutes,
+    triggers Agent CC (emergency rebroker) and Agent C (GPS_DARK_30MIN).
+    Exits automatically when load reaches a terminal status.
+    """
+    from cortexbot.core.redis_client import get_state, set_state, get_redis
+    from cortexbot.integrations.eld_adapter import get_eld_adapter
+
+    POLL_INTERVAL = 300       # 5 minutes
+    TERMINAL_STATUSES = {"DELIVERED", "INVOICED", "PAID", "SETTLED", "FAILED", "TONU"}
+    carrier_id  = state.get("carrier_id", "")
+    eld_provider = state.get("eld_provider") or settings.default_eld_provider
+    eld_vehicle  = state.get("eld_vehicle_id") or state.get("carrier_profile", {}).get("eld_vehicle_id", "")
+    tms_ref      = state.get("tms_ref", load_id[:8])
+
+    logger.info(f"👁️ GPS-dark watcher started: load={load_id} eld={eld_provider}")
+    last_gps_time = asyncio.get_event_loop().time()
+    cc_triggered  = False
+
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+
+        try:
+            # Check current load status — exit if terminal
+            current_state = await get_state(f"cortex:state:load:{load_id}") or {}
+            if current_state.get("status") in TERMINAL_STATUSES:
+                logger.info(f"👁️ GPS-dark watcher exiting: load={load_id} terminal status")
+                break
+
+            # Try to fetch GPS from ELD
+            if eld_vehicle and eld_provider != "none":
+                adapter    = get_eld_adapter(eld_provider)
+                eld_data   = await adapter.get_vehicle_data(
+                    vehicle_id=eld_vehicle,
+                    carrier_id=carrier_id,
+                    use_cache=False,
+                )
+                if eld_data and eld_data.has_valid_gps:
+                    last_gps_time = asyncio.get_event_loop().time()
+                    cc_triggered  = False   # Reset if GPS comes back
+                    continue
+
+            # Check Redis GPS cache as fallback
+            from cortexbot.core.redis_client import get_gps_position
+            cached = await get_gps_position(carrier_id)
+            if cached:
+                cache_age = asyncio.get_event_loop().time() - float(cached.get("_cached_at", 0))
+                if cache_age < _GPS_DARK_THRESHOLD_SECS:
+                    last_gps_time = asyncio.get_event_loop().time()
+                    cc_triggered  = False
+                    continue
+
+            # Check elapsed dark time
+            dark_secs = asyncio.get_event_loop().time() - last_gps_time
+            if dark_secs >= _GPS_DARK_THRESHOLD_SECS and not cc_triggered:
+                logger.warning(
+                    f"📵 GPS dark {dark_secs/60:.0f} min — triggering CC+C "
+                    f"for load {load_id}"
+                )
+                cc_triggered = True
+                # Reload fresh state for CC
+                fresh_state = await get_state(f"cortex:state:load:{load_id}") or state
+
+                # Fire Agent CC (emergency rebroker) as background task
+                from cortexbot.agents.emergency_rebroker import skill_cc_emergency_rebroker
+                asyncio.create_task(
+                    skill_cc_emergency_rebroker(
+                        load_id=load_id,
+                        trigger_reason="GPS_DARK",
+                        state=fresh_state,
+                    ),
+                    name=f"cc_{load_id}",
+                )
+
+                # Also fire Agent C escalation
+                from cortexbot.agents.escalation import skill_c_escalate, EscalationScenario
+                await skill_c_escalate(
+                    scenario=EscalationScenario.GPS_DARK_30MIN,
+                    state=fresh_state,
+                    context={
+                        "gps_last_seen": current_state.get("last_gps_updated", "unknown"),
+                        "last_gps":      (
+                            f"{current_state.get('last_gps_lat', '?')}, "
+                            f"{current_state.get('last_gps_lng', '?')}"
+                        ),
+                        "dark_minutes":  int(dark_secs / 60),
+                    },
+                )
+
+        except asyncio.CancelledError:
+            logger.info(f"👁️ GPS-dark watcher cancelled: load={load_id}")
+            break
+        except Exception as e:
+            logger.warning(f"👁️ GPS-dark watcher error: {e}")
+
+    logger.info(f"👁️ GPS-dark watcher exited: load={load_id}")
 
 
 async def run_collect_pod(state: LoadState) -> LoadState:
@@ -394,8 +498,43 @@ async def run_quickbooks_sync(state: LoadState) -> LoadState:
 
 
 async def run_escalation(state: LoadState) -> LoadState:
-    from cortexbot.agents.escalation import agent_c_minimal
-    result = await agent_c_minimal(state)
+    """
+    Orchestrator node: route to Agent C with the correct scenario.
+    Replaces the old agent_c_minimal call.
+    """
+    from cortexbot.agents.escalation import skill_c_escalate, EscalationScenario
+
+    # Determine scenario from state
+    if state.get("rc_discrepancy_found"):
+        scenario = EscalationScenario.RC_DISCREPANCY
+        context  = {"discrepancies": state.get("rc_discrepancies", [])}
+    elif state.get("breakdown_detected"):
+        scenario = EscalationScenario.BREAKDOWN
+        context  = {}
+    elif state.get("gps_dark"):
+        scenario = EscalationScenario.GPS_DARK_30MIN
+        context  = {"dark_minutes": state.get("gps_dark_minutes", "?")}
+    elif state.get("fraud_detected"):
+        scenario = EscalationScenario.BROKER_FRAUD
+        context  = {
+            "fraud_score": state.get("fraud_risk_score", "?"),
+            "fraud_flags": state.get("fraud_flags", []),
+        }
+    elif any("HOS" in str(e) for e in state.get("error_log", [])):
+        scenario = EscalationScenario.HOS_EMERGENCY
+        context  = {"hos_remaining": state.get("hos_remaining", "?")}
+    elif state.get("retry_count", 0) >= 3:
+        scenario = EscalationScenario.CALL_FAILED_3X
+        context  = {"retry_count": state.get("retry_count")}
+    else:
+        scenario = EscalationScenario.CALL_FAILED_3X
+        context  = {"error_log": state.get("error_log", [])}
+
+    result = await skill_c_escalate(
+        scenario=scenario,
+        state=state,
+        context=context,
+    )
     await _save_checkpoint(state["load_id"], result)
     return result
 

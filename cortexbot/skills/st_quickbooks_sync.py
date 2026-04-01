@@ -63,14 +63,51 @@ async def skill_t_quickbooks_sync(state: dict) -> dict:
 
     Loops through all 4 financial event types and delegates each to the
     2-arg helper skill_t_sync_to_quickbooks().
+
+    COPILOT FIX: previously swallowed all errors and always returned
+    qbo_synced=True. Now tracks per-event success/failure and returns:
+      qbo_synced            True only if ALL events synced without error
+      qbo_sync_status       "success" | "partial" | "failed"
+      qbo_sync_events_attempted  int
+      qbo_sync_events_succeeded  int
+      qbo_sync_events_failed     int
+      qbo_sync_errors            {event_type: error_str, ...}
     """
+    sync_errors: dict[str, str] = {}
+    succeeded_events: list[str] = []
+
     for event_type in _ALL_LOAD_EVENTS:
         try:
             state = await skill_t_sync_to_quickbooks(event_type, state)
+            succeeded_events.append(event_type)
         except Exception as e:
-            logger.warning(f"[T] QBO sync failed for {event_type}: {e}")
+            err_msg = f"{type(e).__name__}: {e}"
+            logger.warning(f"[T] QBO sync failed for {event_type}: {err_msg}")
+            sync_errors[event_type] = err_msg
 
-    return {**state, "qbo_synced": True}
+    attempted  = len(_ALL_LOAD_EVENTS)
+    n_success  = len(succeeded_events)
+    n_failed   = len(sync_errors)
+
+    if n_failed == 0:
+        sync_status = "success"
+        qbo_synced  = True
+    elif n_success > 0:
+        sync_status = "partial"
+        qbo_synced  = False
+    else:
+        sync_status = "failed"
+        qbo_synced  = False
+
+    return {
+        **state,
+        "qbo_synced":                  qbo_synced,
+        "qbo_sync_status":             sync_status,
+        "qbo_sync_events_attempted":   attempted,
+        "qbo_sync_events_succeeded":   n_success,
+        "qbo_sync_events_failed":      n_failed,
+        "qbo_sync_errors":             sync_errors,
+    }
 
 
 # ─────────────────────────────────────────────────────────────

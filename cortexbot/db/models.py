@@ -26,12 +26,10 @@ from sqlalchemy import (
     Numeric, CHAR, ARRAY, BigInteger
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
-from sqlalchemy.orm import relationship, DeclarativeBase
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
-
-class Base(DeclarativeBase):
-    pass
+from cortexbot.db.base import Base  # shared Base — avoids circular import with score_models
 
 
 class Carrier(Base):
@@ -685,4 +683,6 @@ class QuickbooksSyncLog(Base):
         Index("idx_qb_status", "status"),
     )
 
-from cortexbot.db.score_models import BrokerScore, CarrierScore
+# BrokerScore / CarrierScore live in cortexbot.db.score_models.
+# Import them from cortexbot.db (the package __init__) if needed,
+# or directly from cortexbot.db.score_models — never from here.

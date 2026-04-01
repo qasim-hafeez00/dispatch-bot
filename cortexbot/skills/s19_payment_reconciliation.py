@@ -303,6 +303,34 @@ async def skill_19_payment_reconciliation(state: dict) -> dict:
     }
 
 
+
+# ─────────────────────────────────────────────────────────────
+# COPILOT FIX: resolve invoice_id from load_id
+# run_payment_followup_sequence must pass invoice_id to
+# run_followup_step, NOT load_id — they are different UUIDs.
+# ─────────────────────────────────────────────────────────────
+
+async def _get_invoice_id_for_load(load_id: str) -> Optional[str]:
+    """
+    Return the primary invoice_id for a given load_id.
+    Picks the most recently generated invoice if multiple exist
+    (e.g. resubmitted invoices).  Returns None if not found.
+    """
+    from sqlalchemy import text as sa_text
+
+    async with get_db_session() as db:
+        result = await db.execute(sa_text("""
+            SELECT invoice_id
+            FROM   invoices
+            WHERE  load_id = :lid
+            ORDER  BY generated_at DESC
+            LIMIT  1
+        """), {"lid": load_id})
+        row = result.fetchone()
+
+    return str(row[0]) if row else None
+
+
 async def run_payment_followup_sequence(
     load_id: str,
     invoice_number: str,
@@ -316,45 +344,60 @@ async def run_payment_followup_sequence(
     """
     Full follow-up sequence — run as a background task.
     Checks for payment and escalates systematically.
+
+    COPILOT FIX: run_followup_step(invoice_id, step) expects an invoice_id,
+    not a load_id.  We resolve the invoice_id once at the start and reuse it
+    throughout — if no invoice exists yet we bail early rather than silently
+    failing every follow-up step.
     """
     import asyncio
+
+    # Resolve invoice_id once — bail if not found
+    invoice_id = await _get_invoice_id_for_load(load_id)
+    if not invoice_id:
+        logger.warning(
+            f"[S19] run_payment_followup_sequence: no invoice found for "
+            f"load {load_id} — aborting follow-up sequence"
+        )
+        return
 
     due_dt = datetime.fromisoformat(payment_due_date)
 
     await _sleep_until(due_dt - timedelta(days=3))
     if await _check_if_paid(load_id, invoice_amount):
         return
-    await run_followup_step(str(load_id), "DUE_MINUS_3")
+    await run_followup_step(invoice_id, "DUE_MINUS_3")
 
     await _sleep_until(due_dt)
     if await _check_if_paid(load_id, invoice_amount):
         return
-    await run_followup_step(str(load_id), "DUE_DATE")
+    await run_followup_step(invoice_id, "DUE_DATE")
 
     await asyncio.sleep(3 * 86400)
     if await _check_if_paid(load_id, invoice_amount):
         return
-    await run_followup_step(str(load_id), "DUE_PLUS_3")
+    await run_followup_step(invoice_id, "DUE_PLUS_3")
 
     await asyncio.sleep(4 * 86400)
     if await _check_if_paid(load_id, invoice_amount):
         return
-    await run_followup_step(str(load_id), "DUE_PLUS_7")
+    await run_followup_step(invoice_id, "DUE_PLUS_7")
 
     await asyncio.sleep(7 * 86400)
     if await _check_if_paid(load_id, invoice_amount):
         return
-    await run_followup_step(str(load_id), "DUE_PLUS_14")
+    await run_followup_step(invoice_id, "DUE_PLUS_14")
 
     await asyncio.sleep(7 * 86400)
     if await _check_if_paid(load_id, invoice_amount):
         return
-    await run_followup_step(str(load_id), "DUE_PLUS_21")
+    await run_followup_step(invoice_id, "DUE_PLUS_21")
 
     await asyncio.sleep(9 * 86400)
     if await _check_if_paid(load_id, invoice_amount):
         return
-    await run_followup_step(str(load_id), "COLLECTIONS")
+    await run_followup_step(invoice_id, "COLLECTIONS")
+
 
 
 async def record_payment_received(load_id: str, amount_paid: float, state: dict) -> dict:

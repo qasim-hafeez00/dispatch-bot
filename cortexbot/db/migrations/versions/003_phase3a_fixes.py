@@ -207,9 +207,26 @@ def downgrade() -> None:
 def _add_column_if_missing(table: str, column: sa.Column):
     """
     Add a column only if it doesn't already exist.
-    Silently skips if the column is already present (idempotent).
+    Skips silently when the column is genuinely present.
+    Re-raises any OTHER error (permissions, syntax, …) so it fails loudly.
+
+    COPILOT FIX: the previous implementation used a bare `except: pass`
+    which would silently hide real migration errors (e.g. wrong type,
+    missing table, permission denied).  We now use sa.inspect() to
+    check column existence explicitly and only skip the DuplicateColumn
+    case.
     """
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+
     try:
-        op.add_column(table, column)
+        existing_cols = {c["name"] for c in inspector.get_columns(table)}
     except Exception:
-        pass  # Column already exists — safe to ignore
+        # Table doesn't exist yet — let add_column create it (or fail properly)
+        existing_cols = set()
+
+    if column.name in existing_cols:
+        return  # Column already present — nothing to do
+
+    # Column is absent: add it. Any error other than "already exists" propagates.
+    op.add_column(table, column)

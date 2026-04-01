@@ -106,6 +106,19 @@ async def skill_y_open_freight_claim(
         except Exception as e:
             logger.error(f"[SY] DB insert failed: {e}")
 
+        # COPILOT FIX: if the INSERT failed, claim_id is still None.
+        # Don't write an orphaned Event or send a misleading SMS alert.
+        if claim_id is None:
+            logger.error(
+                f"[SY] Aborting claim workflow for load {load_id} — "
+                f"DB insert failed, claim_id is None"
+            )
+            return {
+                "error":   "DB insert failed — freight claim not persisted",
+                "status":  "FAILED",
+                "load_id": load_id,
+            }
+
         db.add(Event(
             event_code="FREIGHT_CLAIM_OPENED",
             entity_type="load",

@@ -96,6 +96,12 @@ async def skill_13_driver_dispatch(state: dict) -> dict:
             .values(
                 status="DISPATCHED",
                 dispatched_at=datetime.now(timezone.utc),
+                # COPILOT FIX: persist driver_phone so downstream skills
+                # (s15, s19, s27) can reach the driver without re-querying
+                # the carrier. Prefer driver_phone; fall back to carrier_phone.
+                driver_phone=(
+                    state.get("driver_phone") or state.get("carrier_phone")
+                ),
             )
         )
         db.add(Event(

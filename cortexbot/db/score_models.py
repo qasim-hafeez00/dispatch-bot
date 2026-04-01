@@ -10,8 +10,8 @@ import uuid
 from sqlalchemy import Column, String, Integer, Float, Date, Numeric, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 
-# Import Base from models (models.py imports us at the bottom)
-from cortexbot.db.models import Base
+# Import shared Base — does NOT import models.py (avoids circular import)
+from cortexbot.db.base import Base
 
 class BrokerScore(Base):
     __tablename__ = "broker_scores"

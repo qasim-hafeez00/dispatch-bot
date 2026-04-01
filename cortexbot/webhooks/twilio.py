@@ -71,10 +71,13 @@ async def _is_duplicate_message(phone: str, body: str) -> bool:
         key      = f"cortex:wa:dedup:{msg_hash}"
 
         r = get_redis()
-        was_new = await r.setnx(key, "1")
-        if was_new:
-            await r.expire(key, 90)     # 90s window covers Twilio retry window
-        return not was_new              # True = duplicate, False = new
+        # COPILOT FIX: use a single atomic SET NX EX instead of the
+        # non-atomic SETNX + EXPIRE pair.  If the process crashes between
+        # the two calls the key would never expire → message permanently
+        # deduplicated.  SET NX EX is atomic on all Redis versions ≥ 2.6.
+        set_result = await r.set(key, "1", nx=True, ex=90)
+        is_new = set_result is not None   # None → key already existed
+        return not is_new                 # True = duplicate, False = new
 
     except Exception as e:
         # If Redis is down, let the message through (fail open)

@@ -94,6 +94,10 @@ class Settings(BaseSettings):
     motive_api_key: str = ""
     motive_base_url: str = "https://api.keeptruckin.com/v1"
 
+    # ── ELD Webhook Secrets (PHASE 3E) ──────────────────────
+    samsara_webhook_secret: str = ""  # Set in .env.local from Samsara dashboard
+    motive_webhook_secret:  str = ""  # Set in .env.local from Motive dashboard
+
     # ── Stripe (Driver Settlement Payments) ───────────────────
     stripe_api_key: str = ""
     stripe_secret_key: str = ""           # alias used by stripe_client.py

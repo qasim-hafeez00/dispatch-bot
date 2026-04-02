@@ -89,7 +89,10 @@ class ELDAdapter:
     """Unified interface for all ELD providers."""
 
     def __init__(self, provider: str):
-        self.provider = provider.lower() if provider else "none"
+        p = (provider or "none").lower()
+        if p == "samsara_eld": p = "samsara"
+        elif p in ("motive_eld", "keeptruckin"): p = "motive"
+        self.provider = p
 
     async def get_vehicle_data(
         self,
@@ -258,15 +261,22 @@ class ELDAdapter:
                 f"{settings.samsara_base_url}/beta/fleet/addresses",
                 headers={"Authorization": f"Bearer {settings.samsara_api_key}"},
                 json={
-                    "name": name,
-                    "geofence": {
-                        "circle": {
-                            "latitude": lat,
-                            "longitude": lng,
-                            "radiusMeters": radius_m,
-                        }
+                    "name":        f"CortexBot-{name}",
+                    "description": f"CortexBot geofence — {name}",
+                    "geofenceTypes": ["circle"],
+                    "circle": {
+                        "latitude":     lat,
+                        "longitude":    lng,
+                        "radiusMeters": radius_m,
                     },
-                    "tags": [{"name": "CortexBot"}],
+                    "externalIds": {
+                        "cortexbot:name":      name,
+                        "cortexbot:stop_type": "pickup" if ":PICKUP" in name.upper() else "delivery",
+                    },
+                    "alertSettings": {
+                        "driverApp": False,
+                        "webHook":   True,
+                    },
                 },
             )
             if resp.status_code in (200, 201):
@@ -276,11 +286,32 @@ class ELDAdapter:
     async def _register_motive_geofence(
         self, vehicle_id: str, name: str, lat: float, lng: float, radius_m: int
     ) -> Optional[str]:
-        # Motive uses landmarks for geo-fencing
         if not settings.motive_api_key:
             return None
-        # Simplified — Motive landmark API
-        return f"motive_gf_{vehicle_id}_{int(time.time())}"
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{settings.motive_base_url}/geofences",
+                headers={"X-Api-Key": settings.motive_api_key},
+                json={
+                    "geofence": {
+                        "name":              f"CortexBot-{name}",
+                        "address":           name,
+                        "latitude":          lat,
+                        "longitude":         lng,
+                        "radius":            radius_m,
+                        "alert_on_enter":    True,
+                        "alert_on_exit":     True,
+                        "metadata": {
+                            "cortexbot_name":      name,
+                            "cortexbot_stop_type": "pickup" if ":PICKUP" in name.upper() else "delivery",
+                        },
+                    }
+                },
+            )
+            if resp.status_code in (200, 201):
+                return resp.json().get("geofence", {}).get("id")
+        return None
 
 
 def get_eld_adapter(provider: str = None) -> ELDAdapter:

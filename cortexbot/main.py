@@ -197,13 +197,16 @@ async def samsara_webhook(request: Request):
     GAP-12 FIX: Samsara ELD webhook — GPS, geo-fence, HOS events.
     Without this route geo-fence arrivals never reach the system
     and the detention clock never starts automatically.
+    PHASE 3E: Read raw body first so HMAC-SHA256 signature can be verified.
     """
     from cortexbot.webhooks.eld_webhooks import handle_samsara_webhook
-    payload   = await request.json()
+    import json as _json
+    raw_body  = await request.body()
+    payload   = _json.loads(raw_body)
     signature = request.headers.get("X-Samsara-Signature", "")
     event_type = payload.get("eventType", "unknown")
     logger.info(f"🛰️ Samsara webhook: {event_type}")
-    asyncio.create_task(handle_samsara_webhook(payload, signature))
+    asyncio.create_task(handle_samsara_webhook(payload, signature, raw_body))
     return {"received": True}
 
 
@@ -211,12 +214,16 @@ async def samsara_webhook(request: Request):
 async def motive_webhook(request: Request):
     """
     GAP-12 FIX: Motive (KeepTruckin) ELD webhook — GPS, geo-fence, HOS events.
+    PHASE 3E: Read raw body first so HMAC-SHA256 signature can be verified.
     """
     from cortexbot.webhooks.eld_webhooks import handle_motive_webhook
-    payload    = await request.json()
+    import json as _json
+    raw_body   = await request.body()
+    payload    = _json.loads(raw_body)
+    signature  = request.headers.get("X-Motive-Signature", "")
     event_type = payload.get("event_type", "unknown")
     logger.info(f"🛰️ Motive webhook: {event_type}")
-    asyncio.create_task(handle_motive_webhook(payload))
+    asyncio.create_task(handle_motive_webhook(payload, signature, raw_body))
     return {"received": True}
 
 

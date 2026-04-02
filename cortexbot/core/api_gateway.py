@@ -257,38 +257,94 @@ _dat_token: Optional[str] = None
 _dat_token_expires_at: float = 0
 _dat_token_lock = asyncio.Lock()
 
+# Redis key for DAT token persistence across restarts
+_DAT_TOKEN_REDIS_KEY = "cortex:dat:token"
+_DAT_TOKEN_META_KEY  = "cortex:dat:token:meta"
+
 _qbo_token: Optional[str] = None
 _qbo_token_expires_at: float = 0
 _qbo_token_lock = asyncio.Lock()
 
 
 async def get_dat_token() -> str:
-    """Thread-safe DAT OAuth2 token fetch with double-checked locking."""
+    """
+    Thread-safe DAT OAuth2 token fetch.
+
+    PHASE 3E: Token persisted to Redis so container restarts do not
+    require an immediate round-trip to the DAT token endpoint.
+
+    Precedence:
+      1. Module-level cache (fastest — zero I/O)
+      2. Redis cache (fast — single GET — survives restart)
+      3. DAT token endpoint (slow — network call)
+    """
     global _dat_token, _dat_token_expires_at
 
+    # ── 1. In-memory cache ─────────────────────────────────
     if _dat_token and time.time() < _dat_token_expires_at - 60:
         return _dat_token
 
     async with _dat_token_lock:
+        # Double-checked locking
         if _dat_token and time.time() < _dat_token_expires_at - 60:
             return _dat_token
 
+        # ── 2. Redis cache ──────────────────────────────────
+        try:
+            from cortexbot.core.redis_client import get_redis
+            r = get_redis()
+            cached_token = await r.get(_DAT_TOKEN_REDIS_KEY)
+            cached_meta  = await r.get(_DAT_TOKEN_META_KEY)
+
+            if cached_token and cached_meta:
+                meta = json.loads(cached_meta)
+                expires_at = float(meta.get("expires_at", 0))
+                if time.time() < expires_at - 60:
+                    _dat_token           = cached_token
+                    _dat_token_expires_at = expires_at
+                    logger.debug("🔑 DAT token loaded from Redis cache")
+                    return _dat_token
+        except Exception as redis_err:
+            logger.warning(f"[API GW] Redis token read failed: {redis_err} — fetching fresh token")
+
+        # ── 3. Fetch from DAT token endpoint ───────────────
+        if not settings.dat_client_id or not settings.dat_client_secret:
+            # DAT not configured — return placeholder so dev environments
+            # don't crash on startup
+            logger.debug("DAT API credentials not configured")
+            return "DAT_NOT_CONFIGURED"
+
         logger.info("🔑 Refreshing DAT OAuth2 token...")
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(
                 f"{settings.dat_base_url}/token",
                 data={
-                    "grant_type": "client_credentials",
-                    "client_id": settings.dat_client_id,
+                    "grant_type":    "client_credentials",
+                    "client_id":     settings.dat_client_id,
                     "client_secret": settings.dat_client_secret,
                 },
-                timeout=10,
             )
             response.raise_for_status()
             token_data = response.json()
-            _dat_token = token_data["access_token"]
-            _dat_token_expires_at = time.time() + token_data.get("expires_in", 3600)
-            logger.info("✅ DAT token refreshed successfully")
+
+        _dat_token           = token_data["access_token"]
+        expires_in           = token_data.get("expires_in", 3600)
+        _dat_token_expires_at = time.time() + expires_in
+
+        # ── Persist to Redis (TTL = expires_in - 120s safety margin) ──
+        try:
+            from cortexbot.core.redis_client import get_redis
+            r = get_redis()
+            ttl = max(60, expires_in - 120)
+            await r.set(_DAT_TOKEN_REDIS_KEY, _dat_token, ex=ttl)
+            await r.set(
+                _DAT_TOKEN_META_KEY,
+                json.dumps({"expires_at": _dat_token_expires_at, "expires_in": expires_in}),
+                ex=ttl,
+            )
+            logger.info(f"✅ DAT token refreshed and cached (TTL={ttl}s)")
+        except Exception as redis_err:
+            logger.warning(f"[API GW] Redis token persist failed: {redis_err} — in-memory only")
 
     return _dat_token
 

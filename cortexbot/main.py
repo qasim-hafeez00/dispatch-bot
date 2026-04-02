@@ -54,6 +54,13 @@ async def lifespan(app: FastAPI):
     from cortexbot.core.redis_client import init_redis
     await init_redis()
 
+    # Phase 3D — start background tasks
+    from cortexbot.agents.system_health import run_health_monitor
+    from cortexbot.agents.disaster_recovery import run_disaster_recovery_tasks
+
+    asyncio.create_task(run_health_monitor(), name="health_monitor")
+    await run_disaster_recovery_tasks()
+
     logger.info("✅ CortexBot ready — all systems online")
     yield
 
@@ -803,3 +810,220 @@ async def debug_queue_depths():
             "compliance_sweep":   await r.llen("bull:cortex:compliance_sweep:wait"),
         },
     }
+
+
+# ============================================================
+# PHASE 3D — ROUTES TO APPEND TO cortexbot/main.py
+# Paste everything below this comment into main.py,
+# before the final closing lines.
+# ============================================================
+
+# ── Agent E: System Health ─────────────────────────────────
+
+@app.get("/health/agents", tags=["System"])
+async def agent_health():
+    """
+    Phase 3D — Agent E
+    Per-agent health status: APIs, queues, circuit breakers, DB, Redis.
+    """
+    from cortexbot.agents.system_health import get_agent_health
+    return await get_agent_health()
+
+
+@app.post("/internal/health/snapshot", tags=["System"])
+async def trigger_health_snapshot():
+    """Force an immediate health snapshot (internal use / debugging)."""
+    from cortexbot.agents.system_health import collect_health_snapshot, _store_snapshot
+    snapshot = await collect_health_snapshot()
+    await _store_snapshot(snapshot)
+    return snapshot
+
+
+# ── Agent Z: Cargo Theft ────────────────────────────────────
+
+@app.post("/internal/cargo-theft/assess/{load_id}", tags=["Internal"])
+async def assess_cargo_theft_risk(load_id: str, request: Request):
+    """
+    Phase 3D — Agent Z
+    Score the theft risk for an active load.
+    Body: { gps_dark_minutes, cc_driver_responded, ... } (optional overrides)
+    """
+    from cortexbot.agents.cargo_theft import skill_z_detect_theft_risk
+    from cortexbot.core.redis_client import get_state
+
+    state   = await get_state(f"cortex:state:load:{load_id}") or {"load_id": load_id}
+    body    = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    state.update(body)
+
+    result = await skill_z_detect_theft_risk(load_id, state)
+    return {
+        "load_id":           load_id,
+        "theft_risk_score":  result.get("theft_risk_score"),
+        "recommendation":    result.get("theft_recommendation"),
+        "factors":           result.get("theft_risk_factors", []),
+    }
+
+
+@app.post("/internal/cargo-theft/activate/{load_id}", tags=["Internal"])
+async def activate_cargo_theft_response(load_id: str, request: Request):
+    """
+    Phase 3D — Agent Z
+    Activate the full cargo theft response protocol for a load.
+    Should only be called after theft_risk_score >= 60.
+    """
+    from cortexbot.agents.cargo_theft import skill_z_activate_response
+    from cortexbot.core.redis_client import get_state
+
+    state = await get_state(f"cortex:state:load:{load_id}") or {"load_id": load_id}
+    body  = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    state.update(body)
+
+    asyncio.create_task(
+        skill_z_activate_response(load_id, state),
+        name=f"theft_{load_id}",
+    )
+    return {
+        "load_id":   load_id,
+        "activated": True,
+        "message":   "Cargo theft response protocol activated. NTC, NICB, and insurance will be notified.",
+    }
+
+
+# ── Agent P: Disaster Recovery ──────────────────────────────
+
+@app.post("/internal/dr/backup-state", tags=["Internal"])
+async def trigger_state_backup():
+    """
+    Phase 3D — Agent P
+    Manually trigger a full load state backup to S3.
+    """
+    from cortexbot.agents.disaster_recovery import skill_p_backup_state
+    result = await skill_p_backup_state()
+    return result
+
+
+@app.post("/internal/dr/restore/{backup_id}", tags=["Internal"])
+async def restore_from_backup(backup_id: str):
+    """
+    Phase 3D — Agent P
+    Restore workflow states from a specific backup snapshot.
+    Use backup_id = 'latest' to restore from the most recent backup.
+    """
+    from cortexbot.agents.disaster_recovery import skill_p_restore_from_backup
+    bid = None if backup_id == "latest" else backup_id
+    result = await skill_p_restore_from_backup(bid)
+    return result
+
+
+@app.post("/internal/dr/pg-backup", tags=["Internal"])
+async def trigger_pg_backup():
+    """
+    Phase 3D — Agent P
+    Manually trigger a PostgreSQL pg_dump backup to S3.
+    """
+    from cortexbot.agents.disaster_recovery import skill_p_pg_backup
+    result = await skill_p_pg_backup()
+    return result
+
+
+@app.post("/internal/dr/drill", tags=["Internal"])
+async def trigger_dr_drill():
+    """
+    Phase 3D — Agent P
+    Manually trigger a DR drill (dry-run restore verification).
+    """
+    from cortexbot.agents.disaster_recovery import skill_p_weekly_dr_drill
+    result = await skill_p_weekly_dr_drill()
+    return result
+
+
+@app.get("/internal/dr/status", tags=["Internal"])
+async def dr_status():
+    """
+    Phase 3D — Agent P
+    Return DR status: last heartbeat, last backup, last drill.
+    """
+    from cortexbot.core.redis_client import get_redis
+    r = get_redis()
+
+    last_heartbeat = await r.get("cortex:dr:last_heartbeat")
+    last_backup_raw = await r.get("cortex:dr:last_backup")
+    last_backup = None
+    if last_backup_raw:
+        try:
+            last_backup = json.loads(last_backup_raw)
+        except Exception:
+            pass
+
+    return {
+        "last_heartbeat": last_heartbeat,
+        "last_backup":    last_backup,
+        "status":         "OK" if last_heartbeat else "NO_HEARTBEAT",
+    }
+
+
+# ── Agent BB: GDPR/CCPA ─────────────────────────────────────
+
+@app.post("/api/carriers/{carrier_id}/data-deletion-request", tags=["Carriers"])
+async def request_data_deletion(carrier_id: str, request: Request):
+    """
+    Phase 3D — Agent BB (GDPR/CCPA)
+    Submit a Right to Be Forgotten / data deletion request for a carrier.
+
+    Body: { requester_email: str, reason: str (optional) }
+
+    The carrier's PII is soft-deleted immediately.
+    All remaining data is permanently purged after a 30-day grace period.
+    Financial records (invoices, settlements) are anonymized but retained
+    for 7 years per IRS/FMCSA requirements.
+    """
+    from cortexbot.agents.gdpr_ccpa import skill_bb_delete_carrier_data
+
+    payload = await request.json()
+    requester_email = payload.get("requester_email")
+
+    if not requester_email:
+        return JSONResponse(
+            status_code=422,
+            content={"error": "requester_email is required"}
+        )
+
+    result = await skill_bb_delete_carrier_data(
+        carrier_id=carrier_id,
+        requester_email=requester_email,
+        reason=payload.get("reason", "RTBF_REQUEST"),
+    )
+    return result
+
+
+@app.get("/api/carriers/{carrier_id}/deletion-request-status", tags=["Carriers"])
+async def get_deletion_request_status(carrier_id: str):
+    """
+    Phase 3D — Agent BB
+    Check the status of an existing data deletion request.
+    """
+    from cortexbot.agents.gdpr_ccpa import _get_deletion_request
+    result = await _get_deletion_request(carrier_id)
+    if not result:
+        return {"status": "NO_REQUEST", "carrier_id": carrier_id}
+    return result
+
+
+@app.post("/internal/gdpr/process-pending-deletions", tags=["Internal"])
+async def process_pending_deletions():
+    """
+    Phase 3D — Agent BB
+    Process all data deletion requests that have passed their grace period.
+    Called by BullMQ compliance_sweep queue daily at 06:00.
+    """
+    from cortexbot.agents.gdpr_ccpa import skill_bb_process_pending_deletions
+    result = await skill_bb_process_pending_deletions()
+    return result

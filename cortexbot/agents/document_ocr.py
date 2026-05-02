@@ -34,6 +34,11 @@ async def extract_rc_fields(s3_url: str) -> dict:
     Returns:
         {"fields": {...}, "quality_score": 0.92, "quality_issues": [...]}
     """
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.ocr_mock import mock_extract_rc_fields
+        return await mock_extract_rc_fields(s3_url)
+
     logger.info(f"📄 OCR extracting RC from {s3_url}")
 
     # Download from S3
@@ -119,6 +124,11 @@ def compare_rc_to_expected(extracted: dict, expected: dict) -> List[str]:
 
 async def _download_from_s3(s3_url: str) -> bytes:
     """Download file from S3 URL."""
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.s3_mock import mock_download
+        return await mock_download(s3_url)
+
     # Parse s3://bucket/key
     without_prefix = s3_url.replace("s3://", "")
     bucket, key    = without_prefix.split("/", 1)

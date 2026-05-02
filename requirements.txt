@@ -71,3 +71,9 @@ pytest==8.3.4
 pytest-asyncio==0.24.0
 pytest-cov==6.0.0
 factory-boy==3.3.1
+
+# ── Local dev / mock layer ─────────────────────────────────────
+# fakeredis: in-process Redis substitute (USE_MOCKS=true)
+fakeredis==2.26.2
+# aiosqlite: async SQLite driver (replaces asyncpg in dev)
+aiosqlite==0.20.0

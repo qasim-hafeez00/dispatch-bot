@@ -17,10 +17,15 @@ _token_expires: float = 0
 async def sign_document(pdf_url: str, signer_name: str, signer_email: str, load_id: str) -> str:
     """
     Sign a PDF document via DocuSign and return the signed document URL (S3).
-    
+
     For Phase 1 development: if DocuSign not configured, applies a text signature
     to the PDF directly using PyMuPDF and uploads to S3.
     """
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.docusign_mock import mock_sign_document
+        return await mock_sign_document(pdf_url, signer_name, signer_email, load_id)
+
     # Development shortcut: sign locally if DocuSign not configured
     if not settings.docusign_integration_key or not settings.docusign_account_id:
         logger.info("DocuSign not configured — using local PDF signing")

@@ -206,6 +206,108 @@ API_CONFIGS = {
 # CIRCUIT BREAKER
 # ============================================================
 
+# ============================================================
+# MOCK DISPATCH TABLE
+# ============================================================
+
+async def _mock_api_call(api_name: str, endpoint: str, payload: dict, params: dict) -> dict:
+    """
+    Returns plausible stub data for each external API so the full
+    pipeline can run locally with USE_MOCKS=true and no paid credentials.
+    """
+    import random
+
+    # ── DAT Load Search ──────────────────────────────────────
+    if api_name == "dat" and "search" in endpoint:
+        from cortexbot.mocks.dat_mock import mock_dat_search
+        origin_city  = (payload or {}).get("originCity", "")
+        origin_state = (payload or {}).get("originState", "")
+        return await mock_dat_search(origin_city=origin_city, origin_state=origin_state)
+
+    # ── DAT Rate View ─────────────────────────────────────────
+    if api_name in ("dat", "dat_rates") and "rate" in endpoint:
+        from cortexbot.mocks.dat_mock import mock_dat_rate
+        p = payload or {}
+        return await mock_dat_rate(
+            p.get("originCity", ""),
+            p.get("destinationCity", ""),
+            p.get("equipmentType", "Van"),
+        )
+
+    # ── FMCSA carrier lookup ──────────────────────────────────
+    if api_name == "fmcsa":
+        return {
+            "content": [{
+                "carrier": {
+                    "dotNumber": "1234567",
+                    "legalName": "Mock Carrier LLC",
+                    "allowedToOperate": "Y",
+                    "safetyRating": "Satisfactory",
+                    "insuranceRequired": "Y",
+                    "insuranceOnFile": "Y",
+                }
+            }]
+        }
+
+    # ── Highway fraud check ───────────────────────────────────
+    if api_name == "highway_fraud":
+        return {"risk_score": 12, "risk_level": "LOW", "flags": [], "verified": True}
+
+    # ── ELD (Samsara / Motive) ────────────────────────────────
+    if api_name in ("samsara", "motive", "samsara_eld", "motive_eld"):
+        if "locations" in endpoint or "gps" in endpoint:
+            return {
+                "data": [{
+                    "latitude": 32.7767, "longitude": -96.7970,
+                    "speed": 62, "heading": 90,
+                    "time": "2026-05-02T12:00:00Z",
+                }]
+            }
+        if "hos" in endpoint or "logs" in endpoint:
+            return {
+                "data": [{
+                    "dutyStatus":         "DRIVING",
+                    "shiftDriveRemaining": 25200,
+                    "shiftRemaining":      36000,
+                    "cycleDriveRemaining": 180000,
+                    "cycleRemaining":      216000,
+                }]
+            }
+        return {}
+
+    # ── Google Maps ───────────────────────────────────────────
+    if api_name == "google_maps":
+        return {
+            "routes": [{
+                "legs": [{
+                    "distance": {"value": 1254000, "text": "779 mi"},
+                    "duration": {"value": 43200,   "text": "12 hours"},
+                }]
+            }],
+            "status": "OK",
+        }
+
+    # ── NOAA weather — no active alerts ──────────────────────
+    if api_name == "noaa_weather":
+        return {"features": []}
+
+    # ── QuickBooks ────────────────────────────────────────────
+    if api_name == "quickbooks":
+        return {"Invoice": {"Id": f"MOCK-INV-{random.randint(1000,9999)}", "DocNumber": "MOCK-001"}}
+
+    # ── EFS / Comdata fuel cards ──────────────────────────────
+    if api_name in ("efs", "comdata"):
+        return {
+            "code":       f"MOCK-FUEL-{random.randint(100000, 999999)}",
+            "network":    api_name,
+            "amount":     (payload or {}).get("amount", 200),
+            "expires_at": "2026-05-03T23:59:59Z",
+        }
+
+    logger.debug("[MOCK api_gateway] unhandled api_name=%s endpoint=%s — returning {}", api_name, endpoint)
+    return {}
+
+
 class CircuitBreaker:
     def __init__(self, threshold: int, timeout_secs: int):
         self.threshold = threshold
@@ -404,6 +506,10 @@ async def api_call(
     Centralized API call with auth, caching, retry, circuit breaker, fallback.
     NO skill should use httpx directly — always go through here.
     """
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        return await _mock_api_call(api_name, endpoint, payload or {}, params or {})
+
     config = API_CONFIGS.get(api_name, {})
     cb = get_circuit_breaker(api_name)
 

@@ -33,6 +33,12 @@ _redis: Optional[aioredis.Redis] = None
 
 async def init_redis():
     global _redis
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.redis_mock import get_fake_redis
+        _redis = await get_fake_redis()
+        logger.info("✅ Redis initialized (mock — fakeredis)")
+        return
     _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
     await _redis.ping()
     logger.info("✅ Redis connected")

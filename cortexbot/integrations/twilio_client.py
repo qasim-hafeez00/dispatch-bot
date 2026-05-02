@@ -13,6 +13,10 @@ async def send_whatsapp(to_phone: str, message: str) -> bool:
     if not to_phone:
         logger.warning("send_whatsapp: empty phone number")
         return False
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.twilio_mock import mock_send_whatsapp
+        return await mock_send_whatsapp(to_phone, message)
     try:
         from twilio.rest import Client
         import asyncio
@@ -37,6 +41,10 @@ async def send_sms(to_phone: str, message: str) -> bool:
     """Send an SMS via Twilio."""
     if not to_phone:
         return False
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.twilio_mock import mock_send_sms
+        return await mock_send_sms(to_phone, message)
     try:
         from twilio.rest import Client
         import asyncio

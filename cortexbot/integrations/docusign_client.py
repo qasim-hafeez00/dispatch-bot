@@ -73,7 +73,7 @@ async def _sign_locally(pdf_url: str, signer_name: str, load_id: str) -> str:
     key   = f"loads/{load_id}/RC_SIGNED_{uuid.uuid4().hex[:8]}.pdf"
     
     import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: s3.put_object(
         Bucket=settings.aws_s3_bucket, 
         Key=key, 
@@ -81,9 +81,21 @@ async def _sign_locally(pdf_url: str, signer_name: str, load_id: str) -> str:
         ContentType="application/pdf"
     ))
 
-    signed_url = f"s3://{settings.aws_s3_bucket}/{key}"
-    logger.info(f"✅ PDF signed locally and saved: {signed_url}")
-    return signed_url
+    s3_url = f"s3://{settings.aws_s3_bucket}/{key}"
+
+    # Generate a pre-signed HTTP URL valid for 7 days so brokers can
+    # open the attachment directly from email without AWS credentials.
+    presigned_url = await loop.run_in_executor(
+        None,
+        lambda: s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.aws_s3_bucket, "Key": key},
+            ExpiresIn=7 * 24 * 3600,
+        ),
+    )
+
+    logger.info(f"✅ PDF signed locally and saved: {s3_url}")
+    return presigned_url
 
 
 async def _download_pdf(url: str) -> bytes:
@@ -97,7 +109,7 @@ async def _download_pdf(url: str) -> bytes:
                 aws_access_key_id=settings.aws_access_key_id,
                 aws_secret_access_key=settings.aws_secret_access_key,
                 region_name=settings.aws_region)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         obj = await loop.run_in_executor(None, lambda: s3.get_object(Bucket=bucket, Key=key))
         return obj["Body"].read()
     else:

@@ -143,8 +143,10 @@ async def skill_13_driver_dispatch(state: dict) -> dict:
 
     updated_state = {
         **state,
-        "status":             "DISPATCHED",
-        "dispatched_at":      datetime.now(timezone.utc).isoformat(),
+        "status":               "DISPATCHED",
+        "dispatch_sent":        True,
+        "awaiting":             "DRIVER_ACK",
+        "dispatched_at":        datetime.now(timezone.utc).isoformat(),
         "geofences_registered": geofence_results,
     }
 

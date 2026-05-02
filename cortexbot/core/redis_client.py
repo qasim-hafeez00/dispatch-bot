@@ -114,18 +114,21 @@ async def wait_for_carrier_decision(load_id: str, timeout_secs: int = 90) -> Opt
     await pubsub.subscribe(channel)
 
     try:
-        deadline = asyncio.get_event_loop().time() + timeout_secs
-        while asyncio.get_event_loop().time() < deadline:
-            remaining = deadline - asyncio.get_event_loop().time()
-            msg = await asyncio.wait_for(
-                pubsub.get_message(ignore_subscribe_messages=True),
-                timeout=min(5.0, remaining),
-            )
+        deadline = asyncio.get_running_loop().time() + timeout_secs
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                msg = await asyncio.wait_for(
+                    pubsub.get_message(ignore_subscribe_messages=True),
+                    timeout=min(5.0, remaining),
+                )
+            except asyncio.TimeoutError:
+                continue
             if msg and msg["type"] == "message":
                 data = json.loads(msg["data"])
                 return data.get("decision")
-        return None
-    except asyncio.TimeoutError:
         return None
     finally:
         await pubsub.unsubscribe(channel)

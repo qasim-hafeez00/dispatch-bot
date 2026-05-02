@@ -141,7 +141,7 @@ async def _download_from_s3(s3_url: str) -> bytes:
     )
 
     import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     response = await loop.run_in_executor(None, lambda: s3.get_object(Bucket=bucket, Key=key))
     return await loop.run_in_executor(None, lambda: response["Body"].read())
 
@@ -158,7 +158,7 @@ async def _textract_extract(pdf_bytes: bytes) -> dict:
             region_name=settings.aws_region,
         )
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
             lambda: textract.analyze_document(
@@ -263,38 +263,29 @@ async def _claude_vision_extract(pdf_bytes: bytes, doc_type: str = "RC") -> dict
         from anthropic import AsyncAnthropic
         client = AsyncAnthropic(api_key=settings.anthropic_api_key)
         
-        # Convert first page of PDF to image for Vision
-        # Use fitz (PyMuPDF) if available
+        # Render all pages (up to 3) so multi-page RCs are fully covered.
         import fitz
-        pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        page    = pdf_doc[0]
-        mat     = fitz.Matrix(2, 2)
-        pix     = page.get_pixmap(matrix=mat)
-        img_bytes = pix.tobytes("jpeg")
+        pdf_doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+        mat      = fitz.Matrix(2, 2)
+        content: list = []
+        for page_idx in range(min(len(pdf_doc), 3)):
+            pix       = pdf_doc[page_idx].get_pixmap(matrix=mat)
+            img_b64   = base64.standard_b64encode(pix.tobytes("jpeg")).decode()
+            content.append({
+                "type": "image",
+                "source": {
+                    "type":       "base64",
+                    "media_type": "image/jpeg",
+                    "data":       img_b64,
+                },
+            })
         pdf_doc.close()
-
-        img_b64 = base64.standard_b64encode(img_bytes).decode()
+        content.append({"type": "text", "text": RC_EXTRACT_PROMPT})
 
         response = await client.messages.create(
             model=settings.claude_model,
             max_tokens=1500,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": RC_EXTRACT_PROMPT,
-                    }
-                ],
-            }],
+            messages=[{"role": "user", "content": content}],
         )
 
         json_text = response.content[0].text.strip()

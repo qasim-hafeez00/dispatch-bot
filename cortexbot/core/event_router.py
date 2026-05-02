@@ -18,6 +18,12 @@ from typing import Callable, Dict, Optional, Any
 from cortexbot.db.session import get_db_session
 from cortexbot.db.models import Event
 
+# Top-level import so tests can patch cortexbot.core.event_router.resume_workflow_after_rc
+try:
+    from cortexbot.core.orchestrator import resume_workflow_after_rc  # noqa: F401
+except ImportError:
+    resume_workflow_after_rc = None  # type: ignore
+
 logger = logging.getLogger("cortexbot.core.event_router")
 
 
@@ -169,7 +175,9 @@ def register_default_handlers():
     async def _on_rc_received(event: dict):
         """Resume orchestrator when RC email arrives."""
         load_id = event["entity_id"]
-        s3_url = event["data"].get("s3_url")
+        data    = event.get("data") or {}
+        # Accept both key variants: rc_s3_url (webhook) and s3_url (internal)
+        s3_url  = data.get("rc_s3_url") or data.get("s3_url")
         if s3_url:
             from cortexbot.core.orchestrator import resume_workflow_after_rc
             await resume_workflow_after_rc(load_id, s3_url)
@@ -207,3 +215,29 @@ def register_default_handlers():
     event_router.register("LOAD_DISPATCHED", _on_load_dispatched)
     event_router.register("PAYMENT_RECEIVED", _on_payment_received)
     event_router.register("FRAUD_ALERT", _on_fraud_alert)
+
+
+async def dispatch_event(event_code: str, data: dict) -> None:
+    """
+    Test-friendly event dispatcher.
+
+    Unlike EventRouter.publish(), this skips DB / Redis persistence and
+    invokes the registered handler directly (await, not create_task) so
+    tests can assert side effects synchronously after the call returns.
+
+    Args:
+        event_code: Event identifier (e.g. "RC_RECEIVED").
+        data:       Payload dict — must contain "load_id" for entity routing.
+    """
+    handler = event_router.get_handler(event_code)
+    if not handler:
+        logger.warning("dispatch_event: no handler registered for '%s'", event_code)
+        return
+
+    payload = {
+        "event_code":  event_code,
+        "entity_id":   data.get("load_id", ""),
+        "entity_type": "load",
+        "data":        data,
+    }
+    await handler(payload)

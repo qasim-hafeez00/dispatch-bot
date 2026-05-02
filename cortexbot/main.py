@@ -54,6 +54,15 @@ async def lifespan(app: FastAPI):
     from cortexbot.core.redis_client import init_redis
     await init_redis()
 
+    from cortexbot.core.event_router import register_default_handlers
+    register_default_handlers()
+
+    # SCALE-2: build graph eagerly so concurrent requests never race on lazy-init
+    import cortexbot.core.orchestrator as _orch
+    _orch._graph = _orch.build_phase2_graph()
+    app.state.dispatch_graph = _orch._graph
+    logger.info("✅ Dispatch graph compiled and cached")
+
     # Phase 3D — start background tasks
     from cortexbot.agents.system_health import run_health_monitor
     from cortexbot.agents.disaster_recovery import run_disaster_recovery_tasks

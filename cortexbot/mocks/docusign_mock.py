@@ -28,6 +28,7 @@ async def mock_sign_document(pdf_url: str, signer_name: str, signer_email: str, 
             f.write(b"%PDF-1.4 mock signed document")
         logger.info("[MOCK DocuSign] created placeholder signed PDF at %s", dst)
 
-    signed_url = f"s3://mock-bucket/{signed_key}"
+    # Return an HTTP URL (mirrors prod behaviour where a pre-signed URL is returned)
+    signed_url = f"http://localhost/mock-s3/{signed_key}"
     logger.info("[MOCK DocuSign] signed by %s (%s) → %s", signer_name, signer_email, signed_url)
     return signed_url

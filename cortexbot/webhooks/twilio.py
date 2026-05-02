@@ -179,7 +179,7 @@ async def _handle_media(phone: str, caption: str, media_urls: list):
                 region_name=settings.aws_region,
             )
             key  = f"loads/{load_id or 'unmatched'}/docs/{uuid.uuid4().hex[:8]}.{ext}"
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
                 lambda: s3.put_object(

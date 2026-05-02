@@ -25,7 +25,7 @@ async def send_whatsapp(to_phone: str, message: str) -> bool:
         from_  = f"whatsapp:{settings.twilio_whatsapp_number}"
         to_    = f"whatsapp:{to_phone}" if not to_phone.startswith("whatsapp:") else to_phone
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(
             None,
             lambda: client.messages.create(from_=from_, to=to_, body=message[:1600])
@@ -50,7 +50,7 @@ async def send_sms(to_phone: str, message: str) -> bool:
         import asyncio
 
         client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
-        loop   = asyncio.get_event_loop()
+        loop   = asyncio.get_running_loop()
         msg = await loop.run_in_executor(
             None,
             lambda: client.messages.create(

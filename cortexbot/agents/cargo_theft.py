@@ -634,7 +634,7 @@ async def _step_preserve_evidence(
             aws_secret_access_key=settings.aws_secret_access_key,
             region_name=settings.aws_region,
         )
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Documents to preserve
         doc_keys = []
@@ -761,7 +761,7 @@ async def _upload_with_legal_hold(content: bytes, s3_key: str, content_type: str
         aws_secret_access_key=settings.aws_secret_access_key,
         region_name=settings.aws_region,
     )
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     await loop.run_in_executor(None, lambda: s3.put_object(
         Bucket=settings.aws_s3_bucket,

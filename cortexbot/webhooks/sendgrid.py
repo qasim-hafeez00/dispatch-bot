@@ -125,24 +125,21 @@ async def _classify_email(from_email: str, subject: str, body: str) -> tuple:
 
 
 async def _llm_classify(from_email: str, subject: str, body: str) -> tuple:
-    """Use GPT-4o-mini to classify ambiguous emails."""
-    from openai import AsyncOpenAI
+    """Use Claude to classify ambiguous emails."""
+    from anthropic import AsyncAnthropic
     from cortexbot.config import settings
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
+    message = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
         max_tokens=20,
+        system=(
+            "Classify this truck dispatch email into exactly ONE word:\n"
+            "RC, CARRIER_PACKET, PAYMENT, DISPUTE, COMPLIANCE, OTHER\n"
+            "Reply with ONLY the category word."
+        ),
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Classify this truck dispatch email into exactly ONE word:\n"
-                    "RC, CARRIER_PACKET, PAYMENT, DISPUTE, COMPLIANCE, OTHER\n"
-                    "Reply with ONLY the category word."
-                )
-            },
             {
                 "role": "user",
                 "content": f"From: {from_email}\nSubject: {subject}\nBody: {body}"
@@ -150,7 +147,7 @@ async def _llm_classify(from_email: str, subject: str, body: str) -> tuple:
         ],
     )
 
-    category = response.choices[0].message.content.strip().upper()
+    category = message.content[0].text.strip().upper()
     valid = {"RC", "CARRIER_PACKET", "PAYMENT", "DISPUTE", "COMPLIANCE", "OTHER"}
     if category not in valid:
         category = "OTHER"

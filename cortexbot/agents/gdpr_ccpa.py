@@ -540,7 +540,7 @@ async def _purge_s3_documents(urls: List[str], carrier_id: str) -> dict:
         aws_secret_access_key=settings.aws_secret_access_key,
         region_name=settings.aws_region,
     )
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     for url in urls:
         try:

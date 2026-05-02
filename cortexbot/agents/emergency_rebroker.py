@@ -342,9 +342,9 @@ async def _wait_for_driver_response(load_id: str, wait_seconds: int) -> bool:
     """
     r = get_redis()
     response_key = f"cortex:cc_driver_response:{load_id}"
-    deadline = asyncio.get_event_loop().time() + wait_seconds
+    deadline = asyncio.get_running_loop().time() + wait_seconds
 
-    while asyncio.get_event_loop().time() < deadline:
+    while asyncio.get_running_loop().time() < deadline:
         try:
             val = await r.get(response_key)
             if val:
@@ -512,9 +512,9 @@ async def _step_attempt_rebook(
     # Wait up to 5 minutes for confirmation
     r = get_redis()
     confirm_key = f"cortex:cc_replacement_confirm:{load_id}"
-    deadline = asyncio.get_event_loop().time() + 300
+    deadline = asyncio.get_running_loop().time() + 300
 
-    while asyncio.get_event_loop().time() < deadline:
+    while asyncio.get_running_loop().time() < deadline:
         try:
             val = await r.get(confirm_key)
             if val:

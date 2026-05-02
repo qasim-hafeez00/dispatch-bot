@@ -132,6 +132,10 @@ class Settings(BaseSettings):
     rts_financial_api_key: str = ""
     rts_financial_base_url: str = "https://api.rtsinc.com/v1"
 
+    # ── Mock / Dev flags ──────────────────────────────────────
+    # mirrors USE_MOCKS env var; authoritative flag lives in mocks/__init__.py
+    use_mocks: bool = False
+
     # ── Escalation ────────────────────────────────────────────
     oncall_phone: str = ""
     oncall_email: str = ""

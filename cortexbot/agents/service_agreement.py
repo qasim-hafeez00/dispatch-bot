@@ -622,7 +622,7 @@ async def _upload_to_s3(content: bytes, s3_key: str) -> str:
         aws_secret_access_key=settings.aws_secret_access_key,
         region_name=settings.aws_region,
     )
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None,
         lambda: s3.put_object(

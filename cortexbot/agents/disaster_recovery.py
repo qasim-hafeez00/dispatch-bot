@@ -510,7 +510,7 @@ async def _upload_to_s3(content: bytes, s3_key: str, content_type: str) -> str:
         aws_secret_access_key=settings.aws_secret_access_key,
         region_name=settings.aws_region,
     )
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: s3.put_object(
         Bucket=BACKUP_BUCKET,
         Key=s3_key,
@@ -530,6 +530,6 @@ async def _download_from_s3(s3_url: str) -> bytes:
         aws_secret_access_key=settings.aws_secret_access_key,
         region_name=settings.aws_region,
     )
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     obj  = await loop.run_in_executor(None, lambda: s3.get_object(Bucket=bucket, Key=key))
     return await loop.run_in_executor(None, lambda: obj["Body"].read())

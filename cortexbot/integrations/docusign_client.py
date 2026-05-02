@@ -17,10 +17,15 @@ _token_expires: float = 0
 async def sign_document(pdf_url: str, signer_name: str, signer_email: str, load_id: str) -> str:
     """
     Sign a PDF document via DocuSign and return the signed document URL (S3).
-    
+
     For Phase 1 development: if DocuSign not configured, applies a text signature
     to the PDF directly using PyMuPDF and uploads to S3.
     """
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.docusign_mock import mock_sign_document
+        return await mock_sign_document(pdf_url, signer_name, signer_email, load_id)
+
     # Development shortcut: sign locally if DocuSign not configured
     if not settings.docusign_integration_key or not settings.docusign_account_id:
         logger.info("DocuSign not configured — using local PDF signing")
@@ -68,7 +73,7 @@ async def _sign_locally(pdf_url: str, signer_name: str, load_id: str) -> str:
     key   = f"loads/{load_id}/RC_SIGNED_{uuid.uuid4().hex[:8]}.pdf"
     
     import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: s3.put_object(
         Bucket=settings.aws_s3_bucket, 
         Key=key, 
@@ -76,9 +81,21 @@ async def _sign_locally(pdf_url: str, signer_name: str, load_id: str) -> str:
         ContentType="application/pdf"
     ))
 
-    signed_url = f"s3://{settings.aws_s3_bucket}/{key}"
-    logger.info(f"✅ PDF signed locally and saved: {signed_url}")
-    return signed_url
+    s3_url = f"s3://{settings.aws_s3_bucket}/{key}"
+
+    # Generate a pre-signed HTTP URL valid for 7 days so brokers can
+    # open the attachment directly from email without AWS credentials.
+    presigned_url = await loop.run_in_executor(
+        None,
+        lambda: s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.aws_s3_bucket, "Key": key},
+            ExpiresIn=7 * 24 * 3600,
+        ),
+    )
+
+    logger.info(f"✅ PDF signed locally and saved: {s3_url}")
+    return presigned_url
 
 
 async def _download_pdf(url: str) -> bytes:
@@ -92,7 +109,7 @@ async def _download_pdf(url: str) -> bytes:
                 aws_access_key_id=settings.aws_access_key_id,
                 aws_secret_access_key=settings.aws_secret_access_key,
                 region_name=settings.aws_region)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         obj = await loop.run_in_executor(None, lambda: s3.get_object(Bucket=bucket, Key=key))
         return obj["Body"].read()
     else:

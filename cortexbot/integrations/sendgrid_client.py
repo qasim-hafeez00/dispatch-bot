@@ -51,7 +51,7 @@ async def send_email(
                             aws_access_key_id=settings.aws_access_key_id,
                             aws_secret_access_key=settings.aws_secret_access_key,
                             region_name=settings.aws_region)
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     obj  = await loop.run_in_executor(None, lambda: s3.get_object(Bucket=bucket, Key=key))
                     data = obj["Body"].read()
                 elif url.startswith("http"):
@@ -71,7 +71,7 @@ async def send_email(
                 message.add_attachment(file_att)
 
         sg   = SendGridAPIClient(settings.sendgrid_api_key)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         resp = await loop.run_in_executor(None, lambda: sg.send(message))
 
         logger.info(f"✅ Email sent to {to}: status={resp.status_code}")

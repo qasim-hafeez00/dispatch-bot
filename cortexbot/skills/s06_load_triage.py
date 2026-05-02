@@ -29,13 +29,12 @@ async def skill_06_load_triage(state: dict) -> dict:
     eligible_loads = []
     
     for load in raw_loads:
-        # 1. Equipment Match (basic check)
+        # 1. Equipment Match — reject if carrier has a preference and the load
+        #    either has no equipment type or a mismatched one.
         load_equip = str(load.get("equipment_type", "")).upper()
-        if equipment_type and equipment_type not in load_equip and load_equip not in equipment_type:
-            # Simple substring match (e.g. 'V' in 'VAN', 'R' in 'REEFER')
-            # If no overlap and not explicitly empty, we might skip, but let's be forgiving if load_equip is unknown
-            if load_equip:
-                logger.debug(f"Skipping load {load.get('id')}: Equipment mismatch ({load_equip} != {equipment_type})")
+        if equipment_type:
+            if not load_equip or (equipment_type not in load_equip and load_equip not in equipment_type):
+                logger.debug(f"Skipping load {load.get('id')}: Equipment mismatch ({load_equip!r} != {equipment_type})")
                 continue
                 
         # 2. Weight Check

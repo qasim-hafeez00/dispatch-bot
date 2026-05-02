@@ -33,6 +33,12 @@ _redis: Optional[aioredis.Redis] = None
 
 async def init_redis():
     global _redis
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.redis_mock import get_fake_redis
+        _redis = await get_fake_redis()
+        logger.info("✅ Redis initialized (mock — fakeredis)")
+        return
     _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
     await _redis.ping()
     logger.info("✅ Redis connected")
@@ -108,18 +114,21 @@ async def wait_for_carrier_decision(load_id: str, timeout_secs: int = 90) -> Opt
     await pubsub.subscribe(channel)
 
     try:
-        deadline = asyncio.get_event_loop().time() + timeout_secs
-        while asyncio.get_event_loop().time() < deadline:
-            remaining = deadline - asyncio.get_event_loop().time()
-            msg = await asyncio.wait_for(
-                pubsub.get_message(ignore_subscribe_messages=True),
-                timeout=min(5.0, remaining),
-            )
+        deadline = asyncio.get_running_loop().time() + timeout_secs
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                msg = await asyncio.wait_for(
+                    pubsub.get_message(ignore_subscribe_messages=True),
+                    timeout=min(5.0, remaining),
+                )
+            except asyncio.TimeoutError:
+                continue
             if msg and msg["type"] == "message":
                 data = json.loads(msg["data"])
                 return data.get("decision")
-        return None
-    except asyncio.TimeoutError:
         return None
     finally:
         await pubsub.unsubscribe(channel)

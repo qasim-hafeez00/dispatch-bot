@@ -93,6 +93,16 @@ class LoadState(TypedDict):
     escalation_flags: List[str]
     packet_sent: Optional[bool]
     dispatch_sent: Optional[bool]
+    awaiting: Optional[str]
+    # ── Fraud / Compliance ───────────────────────────────────
+    fraud_risk_score: Optional[int]
+    fraud_recommendation: Optional[str]
+    fraud_flags: Optional[List[str]]
+    fraud_detected: Optional[bool]
+    hos_drive_remaining: Optional[float]
+    hos_blocks_dispatch: Optional[bool]
+    compliance_blocked: Optional[bool]
+    compliance_issues: Optional[List[str]]
     # ── Phase 2: Transit ─────────────────────────────────────
     eld_provider: Optional[str]
     eld_vehicle_id: Optional[str]
@@ -132,13 +142,32 @@ def route_after_search(state: LoadState) -> str:
 
 def route_after_triage(state: LoadState) -> str:
     if state.get("status") == "ELIGIBLE" and state.get("eligible_loads"):
-        return "rate_intelligence"
+        return "fraud_check"
     elif state.get("load_queue"):
         state["current_load"] = state["load_queue"][0]
         state["load_queue"] = state["load_queue"][1:]
-        return "rate_intelligence"
+        return "fraud_check"
     else:
         return "minimal_escalation"
+
+
+def route_after_fraud(state: LoadState) -> str:
+    recommendation = state.get("fraud_recommendation", "BOOK")
+    if recommendation in ("DO_NOT_BOOK", "EMERGENCY"):
+        return "minimal_escalation"
+    return "rate_intelligence"
+
+
+def route_after_hos_precheck(state: LoadState) -> str:
+    if state.get("hos_blocks_dispatch"):
+        return "minimal_escalation"
+    return "voice_broker_call"
+
+
+def route_after_compliance(state: LoadState) -> str:
+    if state.get("compliance_blocked"):
+        return "minimal_escalation"
+    return "book_load"
 
 
 def route_after_call(state: LoadState) -> str:
@@ -163,7 +192,7 @@ def route_after_call(state: LoadState) -> str:
 def route_after_confirm(state: LoadState) -> str:
     decision = state.get("carrier_decision", "")
     if decision == "CONFIRMED":
-        return "book_load"
+        return "compliance_check"
     elif decision == "REJECTED":
         if state.get("load_queue"):
             state["current_load"] = state["load_queue"][0]
@@ -252,6 +281,93 @@ async def run_triage(state: LoadState) -> LoadState:
     return result
 
 
+async def run_fraud_check(state: LoadState) -> LoadState:
+    """WORKFLOW-1: Broker fraud check before committing rate intelligence resources."""
+    from cortexbot.skills.sx_fraud_detection import skill_x_fraud_detection
+    current_load = state.get("current_load") or {}
+    broker_mc    = current_load.get("broker_mc") or state.get("broker_mc") or ""
+    result = await skill_x_fraud_detection(
+        broker_mc=broker_mc,
+        load_id=state.get("load_id"),
+        carrier_mc=state.get("carrier_mc"),
+    )
+    updated = {
+        **state,
+        "fraud_risk_score":     result.get("fraud_risk_score", 0),
+        "fraud_recommendation": result.get("recommendation", "BOOK"),
+        "fraud_flags":          result.get("flags", []),
+        "fraud_detected":       result.get("recommendation") in ("DO_NOT_BOOK", "EMERGENCY"),
+    }
+    await _save_checkpoint(state["load_id"], updated)
+    return updated
+
+
+async def run_hos_precheck(state: LoadState) -> LoadState:
+    """WORKFLOW-2: HOS check before calling broker — skip call if driver can't run the load."""
+    from cortexbot.core.redis_client import get_cached_hos
+    driver_id       = state.get("eld_driver_id") or state.get("carrier_id")
+    hos_data        = (await get_cached_hos(driver_id)) or {}
+    drive_remaining = float(hos_data.get("drive_remaining_hours", 11.0))
+    # Block only when we have real HOS data and it shows < 3 h remaining
+    blocks = bool(hos_data) and drive_remaining < 3.0
+    updated = {
+        **state,
+        "hos_drive_remaining": drive_remaining,
+        "hos_blocks_dispatch": blocks,
+    }
+    if blocks:
+        updated["error_log"] = state.get("error_log", []) + [
+            f"HOS blocks dispatch: only {drive_remaining:.1f}h drive time remaining"
+        ]
+    await _save_checkpoint(state["load_id"], updated)
+    return updated
+
+
+async def run_compliance_check(state: LoadState) -> LoadState:
+    """WORKFLOW-4: Per-booking compliance gate — verify carrier docs before writing the booking."""
+    from cortexbot.db.session import get_db_session
+    from cortexbot.db.models import Carrier, CarrierDocument
+    from sqlalchemy import select
+    from datetime import date as _date
+
+    carrier_id = state["carrier_id"]
+    issues: list = []
+
+    try:
+        async with get_db_session() as db:
+            r = await db.execute(select(Carrier).where(Carrier.carrier_id == carrier_id))
+            carrier = r.scalar_one_or_none()
+            if not carrier:
+                issues.append("Carrier record not found")
+            elif getattr(carrier, "status", None) == "SUSPENDED":
+                issues.append(f"Carrier is suspended: {getattr(carrier, 'suspension_reason', 'unknown reason')}")
+
+            if not issues:
+                r_docs = await db.execute(
+                    select(CarrierDocument).where(
+                        CarrierDocument.carrier_id == carrier_id,
+                        CarrierDocument.document_type.in_(["COI_AUTO", "COI_CARGO", "MC_AUTHORITY"]),
+                    )
+                )
+                today = _date.today()
+                for doc in r_docs.scalars().all():
+                    if doc.expiry_date and doc.expiry_date <= today:
+                        issues.append(f"{doc.document_type} expired on {doc.expiry_date}")
+    except Exception as e:
+        logger.warning(f"Compliance check DB error for {carrier_id}: {e} — allowing booking")
+
+    blocked = len(issues) > 0
+    updated = {
+        **state,
+        "compliance_blocked": blocked,
+        "compliance_issues":  issues,
+    }
+    if blocked:
+        updated["error_log"] = state.get("error_log", []) + issues
+    await _save_checkpoint(state["load_id"], updated)
+    return updated
+
+
 async def run_rate_intel(state: LoadState) -> LoadState:
     from cortexbot.skills.s07_rate_intelligence import skill_07_rate_intelligence
     result = await skill_07_rate_intelligence(state)
@@ -333,8 +449,33 @@ async def _run_transit_background(state: dict):
 
 async def _run_backhaul_planning(state: dict):
     try:
+        # Trigger 8 h before the scheduled delivery so the carrier has time
+        # to review options before arrival — not at dispatch when it's too early.
+        delivery_date = (
+            (state.get("rc_extracted_fields") or {}).get("delivery_date")
+            or state.get("delivery_date")
+        )
+        if delivery_date:
+            from datetime import datetime, timezone, timedelta
+            try:
+                delivery_dt = datetime.fromisoformat(str(delivery_date).replace("Z", "+00:00"))
+                if delivery_dt.tzinfo is None:
+                    delivery_dt = delivery_dt.replace(tzinfo=timezone.utc)
+                trigger_at = delivery_dt - timedelta(hours=8)
+                wait_secs  = (trigger_at - datetime.now(timezone.utc)).total_seconds()
+                if wait_secs > 0:
+                    logger.info(
+                        f"⏳ Backhaul planning will run in {wait_secs/3600:.1f}h "
+                        f"(8h before delivery) for load {state.get('load_id')}"
+                    )
+                    await asyncio.sleep(wait_secs)
+            except Exception as parse_err:
+                logger.debug(f"Backhaul delivery-date parse failed ({parse_err}), running immediately")
+
         from cortexbot.skills.s21_backhaul_planning import skill_21_backhaul_planning
         await skill_21_backhaul_planning(state)
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
         logger.warning(f"Backhaul planning error: {e}")
 
@@ -368,7 +509,7 @@ async def _watch_gps_dark(load_id: str, state: dict):
     tms_ref      = state.get("tms_ref", load_id[:8])
 
     logger.info(f"👁️ GPS-dark watcher started: load={load_id} eld={eld_provider}")
-    last_gps_time = asyncio.get_event_loop().time()
+    last_gps_time = asyncio.get_running_loop().time()
     cc_triggered  = False
 
     while True:
@@ -390,7 +531,7 @@ async def _watch_gps_dark(load_id: str, state: dict):
                     use_cache=False,
                 )
                 if eld_data and eld_data.has_valid_gps:
-                    last_gps_time = asyncio.get_event_loop().time()
+                    last_gps_time = asyncio.get_running_loop().time()
                     cc_triggered  = False   # Reset if GPS comes back
                     continue
 
@@ -398,14 +539,14 @@ async def _watch_gps_dark(load_id: str, state: dict):
             from cortexbot.core.redis_client import get_gps_position
             cached = await get_gps_position(carrier_id)
             if cached:
-                cache_age = asyncio.get_event_loop().time() - float(cached.get("_cached_at", 0))
+                cache_age = asyncio.get_running_loop().time() - float(cached.get("_cached_at", 0))
                 if cache_age < _GPS_DARK_THRESHOLD_SECS:
-                    last_gps_time = asyncio.get_event_loop().time()
+                    last_gps_time = asyncio.get_running_loop().time()
                     cc_triggered  = False
                     continue
 
             # Check elapsed dark time
-            dark_secs = asyncio.get_event_loop().time() - last_gps_time
+            dark_secs = asyncio.get_running_loop().time() - last_gps_time
             if dark_secs >= _GPS_DARK_THRESHOLD_SECS and not cc_triggered:
                 logger.warning(
                     f"📵 GPS dark {dark_secs/60:.0f} min — triggering CC+C "
@@ -549,9 +690,12 @@ def build_phase2_graph():
     # Phase 1 nodes
     graph.add_node("search_loads", run_search)
     graph.add_node("triage_eligibility", run_triage)
+    graph.add_node("fraud_check", run_fraud_check)          # WORKFLOW-1
     graph.add_node("rate_intelligence", run_rate_intel)
+    graph.add_node("hos_precheck", run_hos_precheck)        # WORKFLOW-2
     graph.add_node("voice_broker_call", run_voice_call)
     graph.add_node("carrier_confirmation", run_carrier_confirm)
+    graph.add_node("compliance_check", run_compliance_check)  # WORKFLOW-4
     graph.add_node("book_load", run_book_load)
     graph.add_node("complete_packet", run_carrier_packet)
     graph.add_node("review_rc", run_rc_review)
@@ -573,9 +717,12 @@ def build_phase2_graph():
     # Phase 1 edges
     graph.add_conditional_edges("search_loads", route_after_search)
     graph.add_conditional_edges("triage_eligibility", route_after_triage)
-    graph.add_edge("rate_intelligence", "voice_broker_call")
+    graph.add_conditional_edges("fraud_check", route_after_fraud)           # WORKFLOW-1
+    graph.add_edge("rate_intelligence", "hos_precheck")                     # WORKFLOW-2
+    graph.add_conditional_edges("hos_precheck", route_after_hos_precheck)   # WORKFLOW-2
     graph.add_conditional_edges("voice_broker_call", route_after_call)
     graph.add_conditional_edges("carrier_confirmation", route_after_confirm)
+    graph.add_conditional_edges("compliance_check", route_after_compliance)  # WORKFLOW-4
     graph.add_edge("book_load", "complete_packet")
     graph.add_edge("complete_packet", "review_rc")
     graph.add_conditional_edges("review_rc", route_after_rc)
@@ -597,12 +744,17 @@ def build_phase2_graph():
 
 
 _graph = None
+_graph_lock = asyncio.Lock()
 
 
 def get_graph():
+    """Return the compiled graph. Normally pre-built in lifespan (SCALE-2)."""
     global _graph
-    if _graph is None:
-        _graph = build_phase2_graph()
+    if _graph is not None:
+        return _graph
+    # Synchronous fallback — safe because build_phase2_graph() is pure Python;
+    # only reached if called before lifespan (e.g. unit tests).
+    _graph = build_phase2_graph()
     return _graph
 
 
@@ -712,137 +864,176 @@ async def start_dispatch_workflow(
     from cortexbot.db.models import Carrier
     from sqlalchemy import select
 
-    async with get_db_session() as db:
-        r = await db.execute(select(Carrier).where(Carrier.carrier_id == carrier_id))
-        carrier = r.scalar_one_or_none()
+    # Carrier-level dedup lock — prevents two concurrent requests from
+    # creating duplicate loads for the same carrier (e.g. double-tap on the UI
+    # or a webhook retry arriving before the first run finishes).
+    redis_client = get_redis()
+    carrier_lock_key = f"cortex:carrier_lock:{carrier_id}"
+    async with redis_client.lock(carrier_lock_key, timeout=900, blocking_timeout=5):
+        async with get_db_session() as db:
+            r_db = await db.execute(select(Carrier).where(Carrier.carrier_id == carrier_id))
+            carrier = r_db.scalar_one_or_none()
 
-    if not carrier:
-        return {"error": "Carrier not found"}
+            if not carrier:
+                return {"error": "Carrier not found"}
 
-    load_id = str(uuid.uuid4())
-    tms_ref = await _generate_tms_ref()
+            # WORKFLOW-3: reject if carrier already has an active workflow
+            _ACTIVE_STATUSES = (
+                "SEARCHING", "ELIGIBLE", "CALLING", "BOOKED",
+                "RC_RECEIVED", "RC_SIGNED", "DISPATCHED", "IN_TRANSIT",
+            )
+            active_res = await db.execute(
+                select(Load).where(
+                    Load.carrier_id == carrier_id,
+                    Load.status.in_(_ACTIVE_STATUSES),
+                ).limit(1)
+            )
+            existing_active = active_res.scalar_one_or_none()
 
-    async with get_db_session() as db:
-        from datetime import datetime, timezone
-        load = Load(
-            load_id=load_id,
-            tms_ref=tms_ref,
-            carrier_id=carrier_id,
-            status="SEARCHING",
-            searched_at=datetime.now(timezone.utc),
-        )
-        db.add(load)
-        db.add(Event(
-            event_code="LOAD_SEARCH_STARTED",
-            entity_type="load",
-            entity_id=load_id,
-            triggered_by="orchestrator",
-            data={"carrier_id": carrier_id, "tms_ref": tms_ref},
-            new_status="SEARCHING",
-        ))
+        if existing_active:
+            logger.warning(
+                f"Carrier {carrier_id} already has active load "
+                f"{existing_active.load_id} (status={existing_active.status})"
+            )
+            return {
+                "error": "carrier_already_active",
+                "existing_load_id": str(existing_active.load_id),
+                "existing_status":  existing_active.status,
+            }
 
-    initial_state: LoadState = {
-        "load_id": load_id,
-        "carrier_id": carrier_id,
-        "tms_ref": tms_ref,
-        "status": "SEARCHING",
-        "retry_count": 0,
-        "error_log": [],
-        "carrier_mc": carrier.mc_number or "",
-        "carrier_email": carrier.owner_email or "",
-        "carrier_whatsapp": carrier.whatsapp_phone or carrier.owner_phone or "",
-        "carrier_equipment": carrier.equipment_type or "",
-        "carrier_rate_floor": float(carrier.rate_floor_cpm or 2.00),
-        "carrier_max_deadhead": int(carrier.max_deadhead_mi or 100),
-        "carrier_owner_name": carrier.owner_name or "",
-        "driver_phone": carrier.driver_phone or carrier.owner_phone or "",
-        "carrier_language": carrier.language_pref or "en",
-        "carrier_profile": {
-            "mc_number": carrier.mc_number,
-            "company_name": carrier.company_name,
-            "equipment_type": carrier.equipment_type,
-            "rate_floor_cpm": float(carrier.rate_floor_cpm or 2.00),
-            "max_weight_lbs": carrier.max_weight_lbs or 44000,
-            "no_touch_only": carrier.no_touch_only or False,
-            "hazmat_cert": carrier.hazmat_cert or False,
-            "preferred_dest_states": carrier.preferred_dest_states or [],
-            "avoid_states": carrier.avoid_states or [],
-            "home_base_city": carrier.home_base_city or "",
-            "home_base_state": carrier.home_base_state or "",
+        load_id = str(uuid.uuid4())
+        tms_ref = await _generate_tms_ref()
+
+        async with get_db_session() as db:
+            from datetime import datetime, timezone
+            load = Load(
+                load_id=load_id,
+                tms_ref=tms_ref,
+                carrier_id=carrier_id,
+                status="SEARCHING",
+                searched_at=datetime.now(timezone.utc),
+            )
+            db.add(load)
+            db.add(Event(
+                event_code="LOAD_SEARCH_STARTED",
+                entity_type="load",
+                entity_id=load_id,
+                triggered_by="orchestrator",
+                data={"carrier_id": carrier_id, "tms_ref": tms_ref},
+                new_status="SEARCHING",
+            ))
+
+        initial_state: LoadState = {
+            "load_id": load_id,
+            "carrier_id": carrier_id,
+            "tms_ref": tms_ref,
+            "status": "SEARCHING",
+            "retry_count": 0,
+            "error_log": [],
+            "carrier_mc": carrier.mc_number or "",
+            "carrier_email": carrier.owner_email or "",
+            "carrier_whatsapp": carrier.whatsapp_phone or carrier.owner_phone or "",
+            "carrier_equipment": carrier.equipment_type or "",
+            "carrier_rate_floor": float(carrier.rate_floor_cpm or 2.00),
+            "carrier_max_deadhead": int(carrier.max_deadhead_mi or 100),
+            "carrier_owner_name": carrier.owner_name or "",
+            "driver_phone": carrier.driver_phone or carrier.owner_phone or "",
+            "carrier_language": carrier.language_pref or "en",
+            "carrier_profile": {
+                "mc_number": carrier.mc_number,
+                "company_name": carrier.company_name,
+                "equipment_type": carrier.equipment_type,
+                "rate_floor_cpm": float(carrier.rate_floor_cpm or 2.00),
+                "max_weight_lbs": carrier.max_weight_lbs or 44000,
+                "no_touch_only": carrier.no_touch_only or False,
+                "hazmat_cert": carrier.hazmat_cert or False,
+                "preferred_dest_states": carrier.preferred_dest_states or [],
+                "avoid_states": carrier.avoid_states or [],
+                "home_base_city": carrier.home_base_city or "",
+                "home_base_state": carrier.home_base_state or "",
+                "eld_provider": carrier.eld_provider or "",
+                "eld_vehicle_id": carrier.eld_vehicle_id,
+                "eld_driver_id": carrier.eld_driver_id,
+                "stripe_account_id": carrier.stripe_account_id,
+                "dispatch_fee_pct": float(carrier.dispatch_fee_pct or 0.06),
+                "factoring_company": carrier.factoring_company,
+                "fuel_card_network": carrier.fuel_card_network,
+                "truck_mpg": float(carrier.truck_mpg or 6.5),
+            },
+            "current_city": current_city or carrier.home_base_city or "",
+            "current_state": current_state or carrier.home_base_state or "",
+            "raw_loads": [],
+            "current_load": None,
+            "load_queue": [],
+            "origin_city": carrier.home_base_city or "",
+            "origin_state": carrier.home_base_state or "",
+            "destination_city": "",
+            "destination_state": "",
+            "loaded_miles": None,
+            "deadhead_miles": None,
+            "broker_phone": None,
+            "broker_mc": None,
+            "broker_email": None,
+            "broker_company": None,
+            "broker_id": None,
+            "broker_contact_name": None,
+            "broker_load_ref": None,
+            "market_rate_cpm": None,
+            "anchor_rate_cpm": None,
+            "counter_rate_cpm": None,
+            "walk_away_rate_cpm": None,
+            "rate_brief": None,
+            "bland_call_id": None,
+            "call_outcome": None,
+            "agreed_rate_cpm": None,
+            "locked_accessorials": None,
+            "load_details_extracted": None,
+            "carrier_decision": None,
+            "rc_s3_url": None,
+            "rc_extracted_fields": None,
+            "rc_discrepancy_found": False,
+            "rc_signed_url": None,
+            "rc_discrepancies": None,
+            "escalation_flags": [],
+            "packet_sent": None,
+            "dispatch_sent": None,
+            "awaiting": None,
+            "fraud_risk_score": None,
+            "fraud_recommendation": None,
+            "fraud_flags": None,
+            "fraud_detected": False,
+            "hos_drive_remaining": None,
+            "hos_blocks_dispatch": False,
+            "compliance_blocked": False,
+            "compliance_issues": None,
             "eld_provider": carrier.eld_provider or "",
             "eld_vehicle_id": carrier.eld_vehicle_id,
             "eld_driver_id": carrier.eld_driver_id,
-            "stripe_account_id": carrier.stripe_account_id,
-            "dispatch_fee_pct": float(carrier.dispatch_fee_pct or 0.06),
-            "factoring_company": carrier.factoring_company,
-            "fuel_card_network": carrier.fuel_card_network,
-            "truck_mpg": float(carrier.truck_mpg or 6.5),
-        },
-        "current_city": current_city or carrier.home_base_city or "",
-        "current_state": current_state or carrier.home_base_state or "",
-        "raw_loads": [],
-        "current_load": None,
-        "load_queue": [],
-        "origin_city": carrier.home_base_city or "",
-        "origin_state": carrier.home_base_state or "",
-        "destination_city": "",
-        "destination_state": "",
-        "loaded_miles": None,
-        "deadhead_miles": None,
-        "broker_phone": None,
-        "broker_mc": None,
-        "broker_email": None,
-        "broker_company": None,
-        "broker_id": None,
-        "broker_contact_name": None,
-        "broker_load_ref": None,
-        "market_rate_cpm": None,
-        "anchor_rate_cpm": None,
-        "counter_rate_cpm": None,
-        "walk_away_rate_cpm": None,
-        "rate_brief": None,
-        "bland_call_id": None,
-        "call_outcome": None,
-        "agreed_rate_cpm": None,
-        "locked_accessorials": None,
-        "load_details_extracted": None,
-        "carrier_decision": None,
-        "rc_s3_url": None,
-        "rc_extracted_fields": None,
-        "rc_discrepancy_found": False,
-        "rc_signed_url": None,
-        "rc_discrepancies": None,
-        "escalation_flags": [],
-        "packet_sent": None,
-        "dispatch_sent": None,
-        "eld_provider": carrier.eld_provider or "",
-        "eld_vehicle_id": carrier.eld_vehicle_id,
-        "eld_driver_id": carrier.eld_driver_id,
-        "transit_monitoring_active": False,
-        "delivered": False,
-        "pod_collected": False,
-        "invoice_id": None,
-        "invoice_number": None,
-        "invoice_submitted": False,
-        "payment_status": None,
-        "dispatch_fee_collected": False,
-        "settlement_paid": False,
-        "gross_revenue": None,
-        "total_accessorials": None,
-        "invoice_amount": None,
-        "dispatch_fee_amount": None,
-        "net_settlement": None,
-        "qbo_invoice_id": None,
-        "qbo_synced": False,
-    }
+            "transit_monitoring_active": False,
+            "delivered": False,
+            "pod_collected": False,
+            "invoice_id": None,
+            "invoice_number": None,
+            "invoice_submitted": False,
+            "payment_status": None,
+            "dispatch_fee_collected": False,
+            "settlement_paid": False,
+            "gross_revenue": None,
+            "total_accessorials": None,
+            "invoice_amount": None,
+            "dispatch_fee_amount": None,
+            "net_settlement": None,
+            "qbo_invoice_id": None,
+            "qbo_synced": False,
+        }
 
-    await _save_checkpoint(load_id, initial_state)
-    asyncio.create_task(_run_graph(load_id, initial_state))
+        await _save_checkpoint(load_id, initial_state)
+        asyncio.create_task(_run_graph(load_id, initial_state))
 
-    logger.info(
-        f"🚀 Dispatch workflow started: load={load_id} tms={tms_ref} carrier={carrier_id}"
-    )
-    return {"load_id": load_id, "tms_ref": tms_ref, "status": "SEARCHING"}
+        logger.info(
+            f"🚀 Dispatch workflow started: load={load_id} tms={tms_ref} carrier={carrier_id}"
+        )
+        return {"load_id": load_id, "tms_ref": tms_ref, "status": "SEARCHING"}
 
 
 async def resume_workflow_after_call(load_id: str, updated_state: dict):
@@ -902,7 +1093,7 @@ async def _run_graph(load_id: str, initial_state: dict):
     lock_key = f"cortex:lock:{load_id}"
 
     try:
-        async with r.lock(lock_key, timeout=60, blocking_timeout=10):
+        async with r.lock(lock_key, timeout=900, blocking_timeout=10):
             graph = get_graph()
             config = {"configurable": {"thread_id": load_id}}
             result = await graph.ainvoke(initial_state, config=config)

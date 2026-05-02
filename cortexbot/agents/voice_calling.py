@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+import uuid
 
 import httpx
 
@@ -77,31 +78,51 @@ async def agent_g_voice_call(state: dict) -> dict:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"{BLAND_AI_BASE}/calls",
-                headers={"authorization": settings.bland_ai_api_key},
-                json=payload,
-            )
-            resp.raise_for_status()
-            call_id = resp.json().get("call_id", "")
+        from cortexbot.mocks import MOCKS_ENABLED
+        if MOCKS_ENABLED:
+            from cortexbot.mocks.bland_mock import mock_initiate_call
+            result = await mock_initiate_call(payload)
+            call_id = result.get("call_id", "")
+        else:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"{BLAND_AI_BASE}/calls",
+                    headers={"authorization": settings.bland_ai_api_key},
+                    json=payload,
+                )
+                resp.raise_for_status()
+                call_id = resp.json().get("call_id", "")
     except Exception as e:
         logger.error(f"[G] Bland AI call initiation failed: {e}")
         return {**state, "call_outcome": "CALL_FAILED", "bland_call_id": None}
 
     logger.info(f"📞 [G] Call initiated — call_id={call_id} broker={broker_phone}")
 
+    # In mock mode store the call→load mapping in Redis so handle_call_complete
+    # can find it even if the ORM write below fails (PG types on SQLite).
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        r = get_redis()
+        await r.set(
+            f"cortex:mock:call:{call_id}",
+            json.dumps({"load_id": load_id, "carrier_id": carrier_id}),
+            ex=3600,
+        )
+
     # Persist call_id in DB
-    async with get_db_session() as db:
+    try:
+      async with get_db_session() as db:
+        load_uuid = uuid.UUID(load_id)
+        carrier_uuid = uuid.UUID(carrier_id)
         db.add(CallLog(
             bland_ai_call_id=call_id,
-            load_id=load_id,
-            carrier_id=carrier_id,
+            load_id=load_uuid,
+            carrier_id=carrier_uuid,
             broker_phone=broker_phone,
         ))
         from sqlalchemy import update as sa_update
         await db.execute(
-            sa_update(Load).where(Load.load_id == load_id).values(
+            sa_update(Load).where(Load.load_id == load_uuid).values(
                 bland_call_id=call_id,
                 broker_called_at=datetime.now(timezone.utc),
                 status="CALLING",
@@ -110,12 +131,14 @@ async def agent_g_voice_call(state: dict) -> dict:
         db.add(Event(
             event_code="BROKER_CONTACTED",
             entity_type="load",
-            entity_id=load_id,
+            entity_id=load_uuid,
             triggered_by="agent_g_voice_calling",
             data={"call_id": call_id, "broker_phone": broker_phone,
                   "dat_load_id": current_load.get("dat_load_id", "")},
             new_status="CALLING",
         ))
+    except Exception as db_err:
+        logger.warning(f"[G] DB write failed (non-fatal in mock mode): {db_err}")
 
     # Save updated state to Redis so webhook can resume
     updated = {
@@ -152,10 +175,31 @@ async def handle_call_complete(payload: dict):
     logger.info(f"[G] Call complete: {call_id} status={bland_status} duration={duration_secs}s")
 
     # Find the matching load from the DB
-    async with get_db_session() as db:
-        from sqlalchemy import select
-        r = await db.execute(select(CallLog).where(CallLog.bland_ai_call_id == call_id))
-        call_record = r.scalar_one_or_none()
+    call_record = None
+    try:
+        async with get_db_session() as db:
+            from sqlalchemy import select
+            r = await db.execute(select(CallLog).where(CallLog.bland_ai_call_id == call_id))
+            call_record = r.scalar_one_or_none()
+    except Exception as db_err:
+        logger.warning(f"[G] DB lookup failed: {db_err}")
+
+    # Mock fallback: look up load_id from Redis when ORM is unavailable
+    if not call_record:
+        from cortexbot.mocks import MOCKS_ENABLED
+        if MOCKS_ENABLED:
+            r_client = get_redis()
+            raw = await r_client.get(f"cortex:mock:call:{call_id}")
+            if raw:
+                data = json.loads(raw)
+
+                class _MockCallRecord:
+                    def __init__(self, d: dict):
+                        self.load_id    = d["load_id"]
+                        self.carrier_id = d["carrier_id"]
+
+                call_record = _MockCallRecord(data)
+                logger.info(f"[G] Mock: resolved call {call_id} → load {data['load_id']} via Redis")
 
     if not call_record:
         logger.warning(f"[G] No CallLog for bland call_id={call_id}")
@@ -187,6 +231,7 @@ async def handle_call_complete(payload: dict):
     # Persist to DB
     async with get_db_session() as db:
         from sqlalchemy import update as sa_update
+        load_uuid = uuid.UUID(load_id)
         await db.execute(
             sa_update(CallLog).where(CallLog.bland_ai_call_id == call_id).values(
                 outcome=outcome,
@@ -200,7 +245,7 @@ async def handle_call_complete(payload: dict):
         db.add(Event(
             event_code="BROKER_CALL_COMPLETED",
             entity_type="load",
-            entity_id=load_id,
+            entity_id=load_uuid,
             triggered_by="agent_g_voice_calling",
             data={"outcome": outcome, "call_id": call_id,
                   "rate": extracted.get("agreed_rate_per_mile"),
@@ -230,9 +275,13 @@ async def handle_call_complete(payload: dict):
 
     await set_state(f"cortex:state:load:{load_id}", updated)
 
-    # Resume the orchestrator graph
-    from cortexbot.core.orchestrator import resume_workflow_after_call
-    await resume_workflow_after_call(load_id, updated)
+    # Resume the orchestrator graph (skipped in mock mode — state already in Redis)
+    from cortexbot.mocks import MOCKS_ENABLED
+    if not MOCKS_ENABLED:
+        from cortexbot.core.orchestrator import resume_workflow_after_call
+        await resume_workflow_after_call(load_id, updated)
+    else:
+        logger.info(f"[G] Mock mode: orchestrator resume skipped for load {load_id}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -304,6 +353,11 @@ async def _extract_call_data(transcript: str, state: dict) -> dict:
     """Use Claude to extract structured data from call transcript."""
     if not transcript:
         return {"outcome": "CALL_FAILED"}
+
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.bland_mock import mock_extract_call_data
+        return await mock_extract_call_data(transcript, state)
 
     from anthropic import AsyncAnthropic
     client = AsyncAnthropic(api_key=settings.anthropic_api_key)

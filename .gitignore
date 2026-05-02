@@ -1,0 +1,6 @@
+.claude/
+.env.local
+cortexbot_dev.db
+**/__pycache__/
+**/*.pyc
+mock_s3/

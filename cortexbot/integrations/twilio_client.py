@@ -13,6 +13,10 @@ async def send_whatsapp(to_phone: str, message: str) -> bool:
     if not to_phone:
         logger.warning("send_whatsapp: empty phone number")
         return False
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.twilio_mock import mock_send_whatsapp
+        return await mock_send_whatsapp(to_phone, message)
     try:
         from twilio.rest import Client
         import asyncio
@@ -21,7 +25,7 @@ async def send_whatsapp(to_phone: str, message: str) -> bool:
         from_  = f"whatsapp:{settings.twilio_whatsapp_number}"
         to_    = f"whatsapp:{to_phone}" if not to_phone.startswith("whatsapp:") else to_phone
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(
             None,
             lambda: client.messages.create(from_=from_, to=to_, body=message[:1600])
@@ -37,12 +41,16 @@ async def send_sms(to_phone: str, message: str) -> bool:
     """Send an SMS via Twilio."""
     if not to_phone:
         return False
+    from cortexbot.mocks import MOCKS_ENABLED
+    if MOCKS_ENABLED:
+        from cortexbot.mocks.twilio_mock import mock_send_sms
+        return await mock_send_sms(to_phone, message)
     try:
         from twilio.rest import Client
         import asyncio
 
         client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
-        loop   = asyncio.get_event_loop()
+        loop   = asyncio.get_running_loop()
         msg = await loop.run_in_executor(
             None,
             lambda: client.messages.create(

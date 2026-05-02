@@ -107,6 +107,7 @@ class Carrier(Base):
     settlements = relationship("DriverSettlement", back_populates="carrier")
     advances    = relationship("DriverAdvance",    back_populates="carrier")
     expenses    = relationship("LoadExpense",       back_populates="carrier")
+    documents   = relationship("CarrierDocument",  back_populates="carrier")
 
     def __repr__(self):
         return f"<Carrier {self.mc_number} — {self.company_name}>"
@@ -829,4 +830,26 @@ class CarrierScore(Base):
 
     __table_args__ = (
         Index("idx_carrier_scores_carrier", "carrier_id", "week_ending"),
+    )
+
+
+class CarrierDocument(Base):
+    """Compliance documents for a carrier (COI, MC Authority, etc.)."""
+    __tablename__ = "carrier_documents"
+
+    document_id   = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    carrier_id    = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), nullable=False)
+    document_type = Column(String(50),  nullable=False)   # COI_AUTO, COI_CARGO, MC_AUTHORITY, W9, NOA
+    s3_url        = Column(Text,        nullable=True)
+    expiry_date   = Column(Date,        nullable=True)
+    verified      = Column(Boolean,     default=False)
+    notes         = Column(Text,        nullable=True)
+    uploaded_at   = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    carrier = relationship("Carrier", back_populates="documents")
+
+    __table_args__ = (
+        Index("idx_carrier_docs_carrier", "carrier_id"),
+        Index("idx_carrier_docs_type",    "carrier_id", "document_type"),
     )

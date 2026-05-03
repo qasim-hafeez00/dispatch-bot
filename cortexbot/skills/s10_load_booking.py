@@ -20,6 +20,10 @@ async def skill_10_load_booking(state: dict) -> dict:
 
     logger.info(f"📝 [S10] Booking load {load_id}")
 
+    if not agreed_cpm or float(agreed_cpm) <= 0:
+        logger.error(f"[S10] Cannot book load {load_id} — agreed_rate_cpm is {agreed_cpm}")
+        return {**state, "status": "BOOKING_FAILED", "error": "agreed_rate_cpm missing"}
+
     async with get_db_session() as db:
         from sqlalchemy import update as sa_update, select
 
@@ -42,14 +46,24 @@ async def skill_10_load_booking(state: dict) -> dict:
             contact_phone = state.get("broker_phone")
 
             if contact_name or contact_email:
-                contact = BrokerContact(
-                    broker_id=broker.broker_id,
-                    name=contact_name,
-                    email=contact_email,
-                    phone=contact_phone,
-                )
-                db.add(contact)
-                await db.flush()
+                contact = None
+                if contact_email:
+                    existing = await db.execute(
+                        select(BrokerContact).where(
+                            BrokerContact.broker_id == broker.broker_id,
+                            BrokerContact.email == contact_email
+                        )
+                    )
+                    contact = existing.scalar_one_or_none()
+                if not contact:
+                    contact = BrokerContact(
+                        broker_id=broker.broker_id,
+                        name=contact_name,
+                        email=contact_email,
+                        phone=contact_phone,
+                    )
+                    db.add(contact)
+                    await db.flush()
                 broker_contact_id = contact.contact_id
             else:
                 broker_contact_id = None

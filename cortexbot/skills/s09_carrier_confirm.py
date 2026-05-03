@@ -150,7 +150,9 @@ async def skill_09_carrier_confirm(state: dict) -> dict:
             .where(Load.load_id == load_id)
             .values(
                 carrier_confirmed_at=datetime.now(timezone.utc) if final == "CONFIRMED" else None,
-                status="CARRIER_CONFIRMING",
+                status="CARRIER_CONFIRMED" if final == "CONFIRMED"
+                       else "CARRIER_REJECTED" if final == "REJECTED"
+                       else "CARRIER_TIMEOUT",
             )
         )
         db.add(Event(
@@ -201,71 +203,3 @@ def _build_offer_message(state: dict) -> str:
         f"REPLY YES or NO now ⏱️"
     )
 
-
-# ============================================================
-# INBOUND WHATSAPP HANDLER
-# Called from webhooks/twilio.py for every incoming WA message
-# ============================================================
-
-async def handle_inbound_whatsapp(phone: str, body: str, media_urls: list = None):
-    """
-    Routes inbound WhatsApp based on what we're awaiting.
-    """
-    ctx = await get_whatsapp_context(phone)
-    if not ctx:
-        # Unknown sender — log and ignore
-        logger.info(f"💬 Message from unknown sender {phone}: '{body[:30]}'")
-        return
-
-    awaiting = ctx.get("awaiting")
-    load_id  = ctx.get("current_load_id")
-
-    if awaiting == "LOAD_CONFIRMATION" and load_id:
-        await _handle_confirmation_response(phone, body, load_id, ctx)
-
-    elif awaiting == "DRIVER_ACK" and load_id:
-        await _handle_driver_ack(phone, body, load_id)
-
-    elif media_urls:
-        # Driver sent photos (BOL, POD, lumper receipt)
-        logger.info(f"📸 Media received from {phone}: {len(media_urls)} file(s)")
-        # Will be handled by Phase 2 POD collection skill
-
-
-async def _handle_confirmation_response(phone: str, body: str, load_id: str, ctx: dict):
-    """Process YES/NO confirmation from carrier."""
-    text = body.lower().strip()
-
-    if any(kw in text for kw in YES_KEYWORDS):
-        decision = "CONFIRMED"
-    elif any(kw in text for kw in NO_KEYWORDS):
-        decision = "REJECTED"
-    else:
-        # Ambiguous — ask again
-        await send_whatsapp(phone, "I need a YES or NO — do you want this load?")
-        return
-
-    # Publish so wait_for_carrier_decision() wakes up
-    await publish_carrier_decision(load_id, decision, body)
-
-    # Clear awaiting
-    await update_whatsapp_context(phone, {"awaiting": None})
-
-
-async def _handle_driver_ack(phone: str, body: str, load_id: str):
-    """Process driver acknowledgement of dispatch sheet."""
-    text = body.lower().strip()
-    positive = {"confirmed", "confirm", "got it", "ok", "received", "on my way", "yes"}
-
-    if any(kw in text for kw in positive):
-        async with get_db_session() as db:
-            db.add(Event(
-                event_code="DRIVER_ACKNOWLEDGED",
-                entity_type="load",
-                entity_id=load_id,
-                triggered_by="s09_wa_handler",
-                data={"message": body},
-            ))
-            await db.commit()
-        await update_whatsapp_context(phone, {"awaiting": None})
-        logger.info(f"✅ Driver acknowledged dispatch for load {load_id}")

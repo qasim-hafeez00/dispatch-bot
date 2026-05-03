@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-this-in-production"
     jwt_algorithm: str = "HS256"
     jwt_expiry_hours: int = 24
+    encryption_key: str = "" # Fernet key (Base64)
 
     # ── AI Models ─────────────────────────────────────────────
     anthropic_api_key: str = ""
@@ -45,6 +46,7 @@ class Settings(BaseSettings):
     bland_ai_api_key: str = ""
     bland_ai_caller_id: str = ""
     bland_ai_base_url: str = "https://api.bland.ai/v1"
+    fmcsa_api_key: str = ""
 
     # ── Twilio (WhatsApp + SMS) ───────────────────────────────
     twilio_account_sid: str = ""
@@ -116,6 +118,7 @@ class Settings(BaseSettings):
     # ── QuickBooks Online ─────────────────────────────────────
     quickbooks_client_id: str = ""
     quickbooks_client_secret: str = ""
+    quickbooks_refresh_token: str = ""
     quickbooks_company_id: str = ""
     quickbooks_base_url: str = "https://quickbooks.api.intuit.com"
     # GAP-03 FIX: quickbooks_realm_id (alias for company_id) and sandbox flag
@@ -147,7 +150,7 @@ class Settings(BaseSettings):
     dat_rate_cache_ttl_seconds: int = 900
     fmcsa_cache_ttl_seconds: int = 86400
     highway_cache_ttl_seconds: int = 3600
-    whatsapp_context_ttl_seconds: int = 86400
+    whatsapp_context_ttl_seconds: int = 7200  # 2 hours (audit recommendation)
     eld_gps_cache_ttl_seconds: int = 60
     eld_hos_cache_ttl_seconds: int = 300
 

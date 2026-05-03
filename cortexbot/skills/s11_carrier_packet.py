@@ -75,9 +75,14 @@ async def skill_11_carrier_packet(state: dict) -> dict:
 
     # GAP FIX: schedule 15-minute follow-up to check for RC arrival
     if sent:
-        asyncio.create_task(
-            _rc_followup_reminder(load_id, broker_email, state.get("tms_ref", str(load_id)))
-        )
+        from cortexbot.core.redis_client import get_redis
+        redis = await get_redis()
+        followup_key = f"cortex:rc_followup:{load_id}"
+        already_scheduled = await redis.set(followup_key, "1", ex=1800, nx=True)
+        if already_scheduled:
+            asyncio.create_task(
+                _rc_followup_reminder(load_id, broker_email, state.get("tms_ref", str(load_id)))
+            )
 
     return {**state, "packet_sent": sent, "status": "PACKET_SENT"}
 

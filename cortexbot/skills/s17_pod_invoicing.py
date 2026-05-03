@@ -28,20 +28,18 @@ from cortexbot.skills.s16_detention_layover import calculate_accessorial_summary
 logger = logging.getLogger("cortexbot.skills.s17")
 
 
-async def skill_17_pod_invoicing(state: dict) -> dict:
+async def skill_17_validate_pod_receipt(state: dict) -> dict:
     """
-    Main entry — collect lumper receipt if needed, then generate and submit invoice.
+    Step 1: Validates POD receipt and prompts for lumper receipt if needed.
+    Does NOT generate or submit invoice.
     """
     load_id      = state["load_id"]
-    carrier_id   = state["carrier_id"]
     carrier_wa   = state.get("carrier_whatsapp", "")
-    broker_email = state.get("broker_email", "")
     tms_ref      = state.get("tms_ref", load_id)
 
-    logger.info(f"💰 [S17] Generating invoice for load {load_id}")
+    logger.info(f"📋 [S17] Validating POD receipt for load {load_id}")
 
-    # GAP FIX: if lumper was required and receipt not yet collected, prompt driver
-    # before generating the invoice so we can include it as a billable line item.
+    # Prompt driver for lumper receipt if it was required but is missing
     if state.get("lumper_required") and not state.get("lumper_receipt_url"):
         if carrier_wa:
             await send_whatsapp(
@@ -51,8 +49,25 @@ async def skill_17_pod_invoicing(state: dict) -> dict:
                 f"We need it to bill the broker for reimbursement.\n\n"
                 f"Without the receipt we cannot recover the lumper cost. 📸"
             )
-        logger.info(f"[S17] Lumper receipt requested for load {load_id} — invoicing will proceed regardless")
-        # We proceed with invoicing anyway (don't block payment) but log the gap
+        logger.info(f"[S17] Lumper receipt requested for load {load_id}")
+
+    return {
+        **state,
+        "pod_collected": True,
+    }
+
+
+async def skill_17_pod_invoicing(state: dict) -> dict:
+    """
+    Step 2: Generate and submit invoice.
+    Assumes POD and lumper receipts (if any) are already handled by skill_17_validate_pod_receipt.
+    """
+    load_id      = state["load_id"]
+    carrier_wa   = state.get("carrier_whatsapp", "")
+    broker_email = state.get("broker_email", "")
+    tms_ref      = state.get("tms_ref", load_id)
+
+    logger.info(f"💰 [S17] Generating invoice for load {load_id}")
 
     # Calculate all line items
     linehaul_rate = float(state.get("agreed_rate_cpm") or 0) * int(state.get("loaded_miles") or 0)

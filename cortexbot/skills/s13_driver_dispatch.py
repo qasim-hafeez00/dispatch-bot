@@ -22,6 +22,8 @@ dispatch — the operator can fall back to manual BOL-based detention.
 """
 
 import logging
+import json
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -31,10 +33,9 @@ from cortexbot.db.session import get_db_session
 from cortexbot.db.models import Load, Carrier, Event, CheckCall
 from cortexbot.integrations.twilio_client import send_whatsapp, send_sms
 from cortexbot.integrations.sendgrid_client import send_email
+from cortexbot.utils.geocode import geocode_address as _ensure_coords
 
-logger = logging.getLogger("cortexbot.skills.s13")
-
-GEOFENCE_RADIUS_METERS = 500    # tight dock-level radius
+logger = logging.getLogger("cortexbot.s13")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -120,6 +121,7 @@ async def skill_13_driver_dispatch(state: dict) -> dict:
             },
             new_status="DISPATCHED",
         ))
+        await db.commit()
 
     # ── 5. Notify broker ──────────────────────────────────────
     if broker_email:
@@ -202,6 +204,16 @@ async def _register_load_geofences(state: dict) -> dict:
     tms_ref = state.get("tms_ref", str(load_id)[:8])
     registered, failed, geofence_ids = 0, 0, []
 
+    def get_radius(stop_type):
+        radius = state.get("carrier_profile", {}).get("geofence_radius_m")
+        if not radius:
+            facility_type = state.get(f"{stop_type}_facility_type", "")
+            if "DC" in facility_type or "DISTRIBUTION" in facility_type.upper():
+                radius = 1200
+            else:
+                radius = 800
+        return radius
+
     # Register pickup geofence
     if pickup_lat and pickup_lng:
         result = await _register_single_geofence(
@@ -212,6 +224,7 @@ async def _register_load_geofences(state: dict) -> dict:
             label=f"{tms_ref}:PICKUP",
             lat=pickup_lat,
             lng=pickup_lng,
+            radius=get_radius("origin")
         )
         if result:
             registered += 1
@@ -232,6 +245,7 @@ async def _register_load_geofences(state: dict) -> dict:
             label=f"{tms_ref}:DELIVERY",
             lat=delivery_lat,
             lng=delivery_lng,
+            radius=get_radius("destination")
         )
         if result:
             registered += 1
@@ -276,25 +290,33 @@ async def _register_single_geofence(
     label: str,
     lat: float,
     lng: float,
+    radius: int,
 ) -> Optional[str]:
     """
     Register one geofence with the ELD provider.
     Returns the geofence_id string on success, None on failure.
     Uses the _eld alias keys (samsara_eld / motive_eld) so auth is correct (GAP-06).
     """
-    try:
-        if eld_provider in ("samsara", "samsara_eld"):
-            return await _register_samsara_geofence(load_id, carrier_id, stop_type, label, lat, lng)
-        elif eld_provider in ("motive", "motive_eld", "keeptruckin"):
-            return await _register_motive_geofence(load_id, carrier_id, stop_type, label, lat, lng)
-        else:
-            logger.warning(f"[S13] Unknown ELD provider '{eld_provider}' — cannot register geofence")
-            return None
-    except Exception as e:
-        logger.warning(
-            f"[S13] Geofence registration failed for {load_id}:{stop_type} ({eld_provider}): {e}"
-        )
-        return None
+    from cortexbot.core.redis_client import get_redis
+    for attempt in range(3):
+        try:
+            if eld_provider in ("samsara", "samsara_eld"):
+                return await _register_samsara_geofence(load_id, carrier_id, stop_type, label, lat, lng, radius)
+            elif eld_provider in ("motive", "motive_eld", "keeptruckin"):
+                return await _register_motive_geofence(load_id, carrier_id, stop_type, label, lat, lng, radius)
+            else:
+                logger.warning(f"[S13] Unknown ELD provider '{eld_provider}' — cannot register geofence")
+                return None
+        except Exception as e:
+            if attempt == 2:
+                redis = await get_redis()
+                await redis.rpush("cortex:dlq:geofence", json.dumps({
+                    "load_id": load_id, "stop_type": stop_type, "lat": lat, "lng": lng, "radius": radius
+                }))
+                await send_sms(settings.oncall_phone, 
+                               f"Geofence registration failed after 3 attempts — {load_id}:{stop_type}")
+            await asyncio.sleep(2 ** attempt)
+    return None
 
 
 async def _register_samsara_geofence(
@@ -304,6 +326,7 @@ async def _register_samsara_geofence(
     label: str,
     lat: float,
     lng: float,
+    radius: int,
 ) -> Optional[str]:
     """Register a geofence via Samsara API."""
     payload = {
@@ -313,7 +336,7 @@ async def _register_samsara_geofence(
         "circle": {
             "latitude":  lat,
             "longitude": lng,
-            "radiusMeters": GEOFENCE_RADIUS_METERS,
+            "radiusMeters": radius,
         },
         "externalIds": {
             "cortexbot:load_id":   load_id,
@@ -335,7 +358,7 @@ async def _register_samsara_geofence(
     geofence_id = result.get("data", {}).get("id")
     logger.info(
         f"[S13] Samsara geofence registered: {label} id={geofence_id} "
-        f"radius={GEOFENCE_RADIUS_METERS}m"
+        f"radius={radius}m"
     )
     return str(geofence_id) if geofence_id else None
 
@@ -347,6 +370,7 @@ async def _register_motive_geofence(
     label: str,
     lat: float,
     lng: float,
+    radius: int,
 ) -> Optional[str]:
     """Register a geofence via Motive (KeepTruckin) API."""
     payload = {
@@ -355,7 +379,7 @@ async def _register_motive_geofence(
             "address":     label,
             "latitude":    lat,
             "longitude":   lng,
-            "radius":      GEOFENCE_RADIUS_METERS,
+            "radius":      radius,
             "alert_on_enter": True,
             "alert_on_exit":  True,
             "metadata": {
@@ -374,49 +398,11 @@ async def _register_motive_geofence(
     geofence_id = result.get("geofence", {}).get("id")
     logger.info(
         f"[S13] Motive geofence registered: {label} id={geofence_id} "
-        f"radius={GEOFENCE_RADIUS_METERS}m"
+        f"radius={radius}m"
     )
     return str(geofence_id) if geofence_id else None
 
 
-# ─────────────────────────────────────────────────────────────
-# COORDINATE RESOLUTION
-# ─────────────────────────────────────────────────────────────
-
-async def _ensure_coords(
-    lat, lng, full_address: str, city_state: str
-) -> tuple:
-    """
-    Return (lat, lng) as floats. If not already provided, geocode via
-    Google Maps. Falls back to city_state string if full_address is blank.
-    """
-    if lat and lng:
-        try:
-            return float(lat), float(lng)
-        except (TypeError, ValueError):
-            pass
-
-    address_to_geocode = full_address.strip() or city_state.strip()
-    if not address_to_geocode:
-        return None, None
-
-    try:
-        result = await api_call(
-            api_name="google_maps",
-            endpoint="/geocode/json",
-            method="GET",
-            params={"address": address_to_geocode},
-            cache_key=f"geocode:{address_to_geocode[:80]}",
-            cache_category="geocode",
-        )
-        results = result.get("results", [])
-        if results:
-            loc = results[0]["geometry"]["location"]
-            return float(loc["lat"]), float(loc["lng"])
-    except Exception as e:
-        logger.warning(f"[S13] Geocode failed for '{address_to_geocode}': {e}")
-
-    return None, None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -480,6 +466,7 @@ async def _create_checkcall_schedule(load_id: str, state: dict):
                     scheduled_at=scheduled_at,
                     status="PENDING",
                 ))
+            await db.commit()
         logger.info(f"[S13] Created {len(schedule)} check-call records for load {load_id}")
     except Exception as e:
         logger.warning(f"[S13] Failed to create check-call schedule for {load_id}: {e}")

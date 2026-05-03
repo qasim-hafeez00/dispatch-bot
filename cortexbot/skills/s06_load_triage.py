@@ -17,6 +17,8 @@ GAP FIXES:
 """
 
 import logging
+from datetime import date
+from cortexbot.utils.equipment import equipment_matches
 
 logger = logging.getLogger("cortexbot.skills.s06_triage")
 
@@ -53,13 +55,25 @@ async def skill_06_load_triage(state: dict) -> dict:
         commodity_raw = str(load.get("commodity", "")).upper()
 
         # 1. Equipment match
-        load_equip = str(load.get("equipment_type", "")).upper()
+        load_equip = str(load.get("equipment_type", ""))
         if equipment_type:
-            if not load_equip or (
-                equipment_type not in load_equip and load_equip not in equipment_type
-            ):
+            if not equipment_matches(equipment_type, load_equip):
                 logger.debug(f"[S06] {load_id}: equipment mismatch ({load_equip!r})")
                 continue
+
+        # 1.5. Past pickup date and min miles (FIX-05)
+        pickup_str = load.get("pickup_date", "")
+        if pickup_str:
+            try:
+                if date.fromisoformat(pickup_str) < date.today():
+                    continue  # stale load
+            except ValueError:
+                pass
+                
+        loaded_miles = float(load.get("loaded_miles") or 0)
+        min_miles = carrier_profile.get("min_loaded_miles", 0)
+        if min_miles and loaded_miles and loaded_miles < min_miles:
+            continue
 
         # 2. Weight check
         load_weight = float(load.get("weight_lbs") or 0)
@@ -129,7 +143,7 @@ async def skill_06_load_triage(state: dict) -> dict:
         if posted_rate:
             margin = float(posted_rate) - rate_floor_cpm
             if margin > 0:
-                score += min(int(margin * 10), 30)  # up to +30 for very high rates
+                score += int(margin * 100)  # Uncapped score based on actual margin
 
         # Drop-and-hook is operationally efficient (no wait time)
         if load.get("drop_and_hook", False):

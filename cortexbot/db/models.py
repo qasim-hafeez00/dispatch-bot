@@ -131,6 +131,7 @@ class Carrier(Base):
     advances    = relationship("DriverAdvance",    back_populates="carrier")
     expenses    = relationship("LoadExpense",       back_populates="carrier")
     documents   = relationship("CarrierDocument",  back_populates="carrier")
+    tax_info    = relationship("CarrierTaxInfo",     back_populates="carrier", uselist=False)
 
     def __repr__(self):
         return f"<Carrier {self.mc_number} — {self.company_name}>"
@@ -876,3 +877,32 @@ class CarrierDocument(Base):
         Index("idx_carrier_docs_carrier", "carrier_id"),
         Index("idx_carrier_docs_type",    "carrier_id", "document_type"),
     )
+
+
+class CarrierTaxInfo(Base):
+    """
+    Secure storage for carrier tax identification.
+    TIN field is encrypted via cryptography.fernet.
+    """
+    __tablename__ = "carrier_tax_info"
+
+    carrier_id   = Column(UUID(as_uuid=True), ForeignKey("carriers.carrier_id"), primary_key=True)
+    tin          = Column(String(200), nullable=True)  # Increased length for encrypted content
+    tin_type     = Column(String(5),   nullable=True)  # EIN or SSN
+    legal_name   = Column(String(200), nullable=True)
+    is_corp      = Column(Boolean,     default=False)
+    w9_on_file   = Column(Boolean,     default=False)
+    w9_url       = Column(Text,        nullable=True)
+    w9_signed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at   = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    carrier = relationship("Carrier", back_populates="tax_info")
+
+    def set_tin(self, plain_tin: str):
+        from cortexbot.utils.crypto import encrypt_string
+        self.tin = encrypt_string(plain_tin)
+
+    def get_tin(self) -> str:
+        from cortexbot.utils.crypto import decrypt_string
+        return decrypt_string(self.tin)

@@ -22,6 +22,8 @@ from cortexbot.core.redis_client import get_redis
 
 logger = logging.getLogger("cortexbot.skills.s07_rate_intel")
 
+WALK_AWAY_MULTIPLIER = 0.95
+
 
 # ─────────────────────────────────────────────────────────────
 # MAIN SKILL ENTRY POINT
@@ -66,7 +68,7 @@ async def skill_07_rate_intelligence(state: dict) -> dict:
 
     anchor_rate_cpm   = round(market_rate_cpm * 1.15, 2)
     counter_rate_cpm  = round(market_rate_cpm * 1.05, 2)
-    walk_away_rate_cpm = round(max(carrier_floor_cpm, market_rate_cpm * 0.95), 2)
+    walk_away_rate_cpm = round(max(carrier_floor_cpm, market_rate_cpm * WALK_AWAY_MULTIPLIER), 2)
 
     if anchor_rate_cpm < carrier_floor_cpm:
         logger.warning(
@@ -92,7 +94,10 @@ async def skill_07_rate_intelligence(state: dict) -> dict:
         "carrier_floor_cpm":    carrier_floor_cpm,
         "strategy":             "AGGRESSIVE" if market_rate_cpm > 3.00 else "BALANCED",
         "equipment":            equipment_type,
-        "talking_points": _talking_points(market_rate_cpm, origin_city, dest_city),
+        "talking_points": _talking_points(
+            market_rate_cpm, origin_city, dest_city, 
+            current_load.get("broker_tier"), current_load.get("broker_days_to_pay")
+        ),
     }
 
     logger.info(
@@ -127,6 +132,8 @@ async def get_rate_brief(
     equipment: str = "53_dry_van",
     origin_state: str = "",
     dest_state: str = "",
+    broker_tier: str = None,
+    days_to_pay: int = None,
 ) -> dict:
     """
     GAP-02 FIX: Called by main.py's POST /internal/rate-data route.
@@ -141,14 +148,14 @@ async def get_rate_brief(
 
     anchor  = round(market_rate_cpm * 1.15, 2)
     counter = round(market_rate_cpm * 1.05, 2)
-    floor   = round(market_rate_cpm * 0.92, 2)
+    floor   = round(market_rate_cpm * WALK_AWAY_MULTIPLIER, 2)
 
     return {
         "market_rate_per_mile": market_rate_cpm,
         "anchor_rate":          anchor,
         "counter_rate":         counter,
         "walk_away_rate":       floor,
-        "talking_points":       _talking_points(market_rate_cpm, origin_city, dest_city),
+        "talking_points":       _talking_points(market_rate_cpm, origin_city, dest_city, broker_tier, days_to_pay),
         "lane":                 f"{origin_city} → {dest_city}",
         "equipment":            equipment,
         "data_source":          "DAT",
@@ -195,23 +202,31 @@ async def _fetch_market_rate(
     return rate
 
 
-def _talking_points(market_rate: float, origin_city: str, dest_city: str) -> str:
+def _talking_points(market_rate: float, origin_city: str, dest_city: str, broker_tier: str = None, days_to_pay: int = None) -> str:
     """Generate concise rate justification for the voice agent."""
+    msg = ""
     if market_rate >= 3.00:
-        return (
+        msg = (
             f"DAT shows {origin_city}→{dest_city} is very tight right now. "
             f"Trucks are scarce and loads are moving fast at these rates."
         )
     elif market_rate >= 2.50:
-        return (
+        msg = (
             f"The DAT average for this lane is right at market. "
             f"We're seeing strong demand on {origin_city}→{dest_city} this week."
         )
     else:
-        return (
+        msg = (
             f"We're competitive on this lane — "
             f"our carrier has availability today specifically for {origin_city}→{dest_city}."
         )
+        
+    if broker_tier:
+        msg += f" Broker is a Tier {broker_tier} partner."
+    if days_to_pay is not None:
+        msg += f" They pay in {days_to_pay} days on average."
+        
+    return msg
 
 
 # ─────────────────────────────────────────────────────────────
@@ -246,7 +261,7 @@ def _calculate_negotiation_targets(rate_data: dict) -> dict:
 
     anchor  = round(rate_7 * 1.15, 2)
     counter = round(rate_7 * 1.05, 2)
-    floor   = round(rate_7 * 0.92, 2)
+    floor   = round(rate_7 * WALK_AWAY_MULTIPLIER, 2)
 
     return {
         "market_rate_7day":   rate_7,

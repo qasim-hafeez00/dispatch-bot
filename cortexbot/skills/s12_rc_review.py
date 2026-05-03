@@ -51,6 +51,12 @@ async def skill_12_rc_review(state: dict) -> dict:
         await _escalate(state, [f"OCR extraction failed: {e}"])
         return {**state, "status": "RC_OCR_FAILED", "rc_discrepancy_found": True}
 
+    REQUIRED_OCR_FIELDS = ["rate_per_mile", "flat_rate", "load_reference", "broker_mc"]
+    populated = sum(1 for f in REQUIRED_OCR_FIELDS if rc_fields.get(f))
+    if populated == 0:
+        await _escalate(state, ["OCR returned zero fields — PDF may be unreadable or encrypted"])
+        return {**state, "status": "RC_OCR_EMPTY", "rc_discrepancy_found": True}
+
     # ── Field Comparison ─────────────────────────────────────
     negotiated = state.get("load_details_extracted", {})
     discrepancies = _compare_fields(rc_fields, negotiated, state)

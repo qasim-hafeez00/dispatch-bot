@@ -26,6 +26,7 @@ from cortexbot.core.api_gateway import api_call, APIError
 from cortexbot.core.redis_client import get_redis
 from cortexbot.db.session import get_db_session
 from cortexbot.db.models import Carrier, Event
+from cortexbot.utils.geocode import reverse_geocode as _reverse_geocode
 
 # Radius grows by this amount per retry so we don't keep hammering the same area
 RADIUS_STEP_MILES = 50
@@ -68,6 +69,19 @@ async def skill_05_load_search(state: dict) -> dict:
 
     all_loads = await _search_dat(search_config)
     logger.info(f"📦 Load search returned {len(all_loads)} loads")
+
+    # FIX-02: deduplicate
+    seen_key = f"cortex:seen_loads:{carrier_id}"
+    redis = await get_redis()
+    seen_ids = await redis.smembers(seen_key)
+    seen_ids = {idx.decode('utf-8') if isinstance(idx, bytes) else idx for idx in seen_ids}
+    
+    all_loads = [l for l in all_loads if l.get("dat_load_id") not in seen_ids]
+    if all_loads:
+        valid_ids = [l.get("dat_load_id") for l in all_loads if l.get("dat_load_id")]
+        if valid_ids:
+            await redis.sadd(seen_key, *valid_ids)
+            await redis.expire(seen_key, 86400)
 
     if not all_loads:
         logger.info(f"📭 No loads found — posting truck on DAT")
@@ -163,26 +177,6 @@ async def _resolve_current_position(
     return None, None
 
 
-async def _reverse_geocode(lat: float, lng: float) -> Tuple[Optional[str], Optional[str]]:
-    """Convert GPS coordinates to city/state via Google Maps reverse geocoding."""
-    try:
-        result = await api_call(
-            "google_maps",
-            "/geocode/json",
-            method="GET",
-            params={"latlng": f"{lat},{lng}", "result_type": "locality|administrative_area_level_1"},
-            cache_key=f"revgeocode:{lat:.3f},{lng:.3f}",
-            cache_category="geocode",
-        )
-        for component in result.get("results", [{}])[0].get("address_components", []):
-            types = component.get("types", [])
-            if "locality" in types:
-                city = component["long_name"]
-            if "administrative_area_level_1" in types:
-                state = component["short_name"]
-        return city, state  # type: ignore[possibly-undefined]
-    except Exception:
-        return None, None
 
 
 def _build_search_config(
@@ -262,7 +256,11 @@ async def _search_dat(config: dict) -> list:
             cache_category="search",
         )
 
-        return _parse_dat_results(result.get("matchingLoads", []))
+        if "matchingLoads" in result:
+            return _parse_dat_results(result["matchingLoads"])
+        elif "loads" in result or "data" in result:
+            return _parse_truckstop_results(result.get("loads") or result.get("data", []))
+        return []
 
     except APIError as e:
         # API gateway exhausted all retries AND the Truckstop fallback.
@@ -340,6 +338,40 @@ def _parse_dat_results(dat_loads: list) -> list:
             })
         except Exception as e:
             logger.warning(f"Failed to parse DAT load: {e}")
+            continue
+
+    return parsed
+
+
+def _parse_truckstop_results(truckstop_loads: list) -> list:
+    parsed = []
+    for load in truckstop_loads:
+        try:
+            origin = load.get("origin", {})
+            dest = load.get("destination", {})
+            broker = load.get("broker", {})
+
+            parsed.append({
+                "source": "TRUCKSTOP",
+                "dat_load_id": load.get("id", ""),
+                "broker_mc": broker.get("mcNumber", ""),
+                "broker_company": broker.get("companyName", ""),
+                "broker_phone": broker.get("phone", ""),
+                "origin_city": origin.get("city", ""),
+                "origin_state": origin.get("state", ""),
+                "destination_city": dest.get("city", ""),
+                "destination_state": dest.get("state", ""),
+                "pickup_date": load.get("pickupDate", "")[:10] if load.get("pickupDate") else "",
+                "equipment_type": load.get("equipment", {}).get("type", ""),
+                "weight_lbs": load.get("weight"),
+                "commodity": load.get("commodity", ""),
+                "posted_rate_cpm": load.get("rate", {}).get("ratePerMile"),
+                "quick_pay_available": load.get("quickPay", False),
+                "drop_and_hook": load.get("dropAndHook", False),
+                "load_requirements": load.get("requirements", {}),
+            })
+        except Exception as e:
+            logger.warning(f"Failed to parse Truckstop load: {e}")
             continue
 
     return parsed

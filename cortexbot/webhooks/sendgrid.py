@@ -201,11 +201,16 @@ async def _upload_to_s3(content, filename: str, category: str) -> str:
     if isinstance(content, str):
         content = content.encode("latin-1")
 
-    s3.put_object(
-        Bucket=settings.aws_s3_bucket,
-        Key=key,
-        Body=content,
-        ContentType="application/pdf",
+    import asyncio
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: s3.put_object(
+            Bucket=settings.aws_s3_bucket,
+            Key=key,
+            Body=content,
+            ContentType="application/pdf",
+        )
     )
 
     return f"s3://{settings.aws_s3_bucket}/{key}"

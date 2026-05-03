@@ -26,6 +26,14 @@ import time
 from typing import Any, Optional
 
 import httpx
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    wait_fixed,
+    retry_if_exception_type,
+    before_sleep_log,
+)
 
 from cortexbot.config import settings
 from cortexbot.core.redis_client import get_redis
@@ -68,7 +76,7 @@ def _motive_config() -> dict:
 API_CONFIGS = {
     # ── Load Boards ───────────────────────────────────────────
     "dat": {
-        "base_url": settings.dat_loads_url,
+        "base_url": "https://freight.api.dat.com",
         "auth_type": "oauth2_dat",
         "rate_limit_per_minute": 60,
         "cache_ttl": {"search": 180, "rates": 900},
@@ -79,7 +87,7 @@ API_CONFIGS = {
         "circuit_breaker_timeout": 60,
     },
     "dat_rates": {
-        "base_url": settings.dat_rates_url,
+        "base_url": "https://rates.api.dat.com",
         "auth_type": "oauth2_dat",
         "rate_limit_per_minute": 30,
         "cache_ttl": {"rates": 900},
@@ -169,7 +177,7 @@ API_CONFIGS = {
     },
     # ── Financial ─────────────────────────────────────────────
     "quickbooks": {
-        "base_url": settings.quickbooks_base_url,
+        "base_url": f"{'https://sandbox-quickbooks.api.intuit.com' if settings.quickbooks_sandbox else settings.quickbooks_base_url}/v3/company/{settings.effective_quickbooks_realm_id}",
         "auth_type": "oauth2_qbo",
         "cache_ttl": {"accounts": 3600},
         "retry_attempts": 3,
@@ -198,6 +206,17 @@ API_CONFIGS = {
         "retry_backoff": "linear",
         "circuit_breaker_threshold": 3,
         "circuit_breaker_timeout": 30,
+    },
+    "fmcsa": {
+        "base_url": "https://mobile.fmcsa.dot.gov/qc/services/carrier",
+        "auth_type": "query_param",
+        "param_name": "webKey",
+        "api_key": settings.fmcsa_api_key,
+        "cache_ttl": {"carrier": 86400},
+        "retry_attempts": 2,
+        "retry_backoff": "linear",
+        "circuit_breaker_threshold": 3,
+        "circuit_breaker_timeout": 300,
     },
 }
 
@@ -452,7 +471,10 @@ async def get_dat_token() -> str:
 
 
 async def _get_qbo_token() -> str:
-    """Thread-safe QuickBooks Online token refresh."""
+    """
+    Thread-safe QuickBooks Online token refresh.
+    Persists tokens to Redis to avoid session loss on restart.
+    """
     global _qbo_token, _qbo_token_expires_at
 
     if _qbo_token and time.time() < _qbo_token_expires_at - 60:
@@ -462,8 +484,33 @@ async def _get_qbo_token() -> str:
         if _qbo_token and time.time() < _qbo_token_expires_at - 60:
             return _qbo_token
 
+        r = get_redis()
+        # 1. Try to load from Redis
+        try:
+            cached_token = await r.get("cortex:qbo:access_token")
+            cached_expiry = await r.get("cortex:qbo:access_token:expires_at")
+            if cached_token and cached_expiry:
+                if time.time() < float(cached_expiry) - 60:
+                    _qbo_token = cached_token.decode() if isinstance(cached_token, bytes) else cached_token
+                    _qbo_token_expires_at = float(cached_expiry)
+                    return _qbo_token
+        except Exception:
+            pass
+
+        # 2. Refresh from Intuit
         if not settings.quickbooks_client_id:
             return "QBO_NOT_CONFIGURED"
+
+        # Get current refresh token
+        refresh_token = await r.get("cortex:qbo:refresh_token")
+        if refresh_token:
+            refresh_token = refresh_token.decode() if isinstance(refresh_token, bytes) else refresh_token
+        else:
+            refresh_token = settings.quickbooks_refresh_token
+
+        if not refresh_token:
+            logger.warning("No QBO refresh token available in Redis or Settings")
+            return "QBO_NO_REFRESH_TOKEN"
 
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -472,17 +519,30 @@ async def _get_qbo_token() -> str:
                     headers={"Accept": "application/json"},
                     data={
                         "grant_type": "refresh_token",
-                        "refresh_token": settings.quickbooks_client_secret,
+                        "refresh_token": refresh_token,
                     },
                     auth=(settings.quickbooks_client_id, settings.quickbooks_client_secret),
                 )
                 if resp.status_code == 200:
                     data = resp.json()
                     _qbo_token = data["access_token"]
-                    _qbo_token_expires_at = time.time() + data.get("expires_in", 3600)
+                    expires_in = data.get("expires_in", 3600)
+                    _qbo_token_expires_at = time.time() + expires_in
+                    
+                    # Update Redis
+                    await r.set("cortex:qbo:access_token", _qbo_token, ex=expires_in)
+                    await r.set("cortex:qbo:access_token:expires_at", _qbo_token_expires_at, ex=expires_in)
+                    
+                    if "refresh_token" in data:
+                        # QBO refresh tokens are valid for 101 days, but they can be rotated
+                        await r.set("cortex:qbo:refresh_token", data["refresh_token"], ex=86400 * 100)
+                    
+                    logger.info("✅ QBO tokens refreshed and persisted to Redis")
                     return _qbo_token
+                else:
+                    logger.error(f"❌ QBO token refresh failed: {resp.status_code} {resp.text}")
         except Exception as e:
-            logger.warning(f"QBO token refresh failed: {e}")
+            logger.warning(f"💥 QBO token refresh error: {e}")
             return "QBO_TOKEN_ERROR"
 
     return _qbo_token or "QBO_TOKEN_UNAVAILABLE"
@@ -559,63 +619,67 @@ async def api_call(
         headers.pop("Content-Type", None)
 
     max_attempts = config.get("retry_attempts", 3)
+    backoff_type = config.get("retry_backoff", "exponential")
     url = f"{base_url}{endpoint}"
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    json=payload if payload and method in ("POST", "PUT", "PATCH") else None,
-                    params=params,
-                    timeout=timeout,
-                )
+    # FIX-10: Robust retries using Tenacity
+    from tenacity import AsyncRetrying
 
-                if response.status_code == 429:
-                    wait = 2 ** attempt
-                    logger.warning(f"⚠️ Rate limited by {api_name} — waiting {wait}s")
-                    await asyncio.sleep(wait)
-                    continue
+    wait_strategy = (
+        wait_exponential(multiplier=1, min=2, max=10)
+        if backoff_type == "exponential"
+        else wait_fixed(2)
+    )
 
-                response.raise_for_status()
-                cb.record_success()
+    try:
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(max_attempts),
+            wait=wait_strategy,
+            retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        ):
+            with attempt:
+                async with httpx.AsyncClient() as client:
+                    response = await client.request(
+                        method=method,
+                        url=url,
+                        headers=headers,
+                        json=payload if payload and method in ("POST", "PUT", "PATCH") else None,
+                        params=params,
+                        timeout=timeout,
+                    )
 
-                try:
-                    result = response.json()
-                except Exception:
-                    result = {"text": response.text}
+                    if response.status_code == 429:
+                        # Tenacity doesn't natively handle 429 via exception unless we raise one
+                        # or we can just let this attempt fail and retry.
+                        response.raise_for_status() 
 
-                if cache_key and method == "GET" and cache_category:
+                    response.raise_for_status()
+                    cb.record_success()
+
                     try:
-                        ttl = config.get("cache_ttl", {}).get(cache_category, 300)
-                        r = get_redis()
-                        await r.set(
-                            f"cortex:cache:{api_name}:{cache_key}",
-                            json.dumps(result),
-                            ex=ttl,
-                        )
+                        result = response.json()
                     except Exception:
-                        pass
+                        result = {"text": response.text}
 
-                return result
+                    if cache_key and method == "GET" and cache_category:
+                        try:
+                            ttl = config.get("cache_ttl", {}).get(cache_category, 300)
+                            r = get_redis()
+                            await r.set(
+                                f"cortex:cache:{api_name}:{cache_key}",
+                                json.dumps(result),
+                                ex=ttl,
+                            )
+                        except Exception:
+                            pass
 
-        except httpx.TimeoutException:
-            logger.warning(f"⏰ Timeout: {api_name} attempt {attempt}/{max_attempts}")
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"❌ HTTP {e.response.status_code} from {api_name}: {e}")
-            if e.response.status_code < 500:
-                raise
-        except Exception as e:
-            logger.error(f"💥 Error calling {api_name}: {e}")
+                    return result
 
-        if attempt < max_attempts:
-            backoff = config.get("retry_backoff", "exponential")
-            wait = (2 ** attempt) if backoff == "exponential" else attempt
-            await asyncio.sleep(wait)
-
-    cb.record_failure()
+    except Exception as e:
+        logger.error(f"💥 Persistent error calling {api_name} after {max_attempts} attempts: {e}")
+        cb.record_failure()
 
     fallback = config.get("fallback")
     if fallback and fallback != "human_escalation":
@@ -625,7 +689,7 @@ async def api_call(
             cache_key, cache_category, timeout,
         )
 
-    raise APIError(f"All {max_attempts} attempts to {api_name} failed")
+    raise APIError(f"All {max_attempts} attempts to {api_name} failed: {e}")
 
 
 class APIError(Exception):

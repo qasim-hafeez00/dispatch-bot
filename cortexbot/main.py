@@ -70,6 +70,25 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(run_health_monitor(), name="health_monitor")
     await run_disaster_recovery_tasks()
 
+    # Phase 1 GAP FIX: Re-launch GPS-dark watchers for loads in IN_TRANSIT
+    try:
+        from cortexbot.core.redis_client import get_redis, get_state
+        from cortexbot.core.orchestrator import _watch_gps_dark
+        r = get_redis()
+        keys = await r.keys("cortex:state:load:*")
+        relaunched = 0
+        for key in keys:
+            state = await get_state(key)
+            if state and state.get("status") == "IN_TRANSIT":
+                load_id = state.get("load_id")
+                if load_id:
+                    asyncio.create_task(_watch_gps_dark(load_id, state), name=f"gps_watch_{load_id}")
+                    relaunched += 1
+        if relaunched > 0:
+            logger.info(f"✅ Relaunched {relaunched} GPS-dark watchers for IN_TRANSIT loads")
+    except Exception as e:
+        logger.warning(f"Failed to relaunch GPS watchers: {e}")
+
     logger.info("✅ CortexBot ready — all systems online")
     yield
 
@@ -96,6 +115,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# FIX-09: Correlation ID Middleware
+@app.middleware("http")
+async def add_correlation_id(request: Request, call_next):
+    import uuid
+    correlation_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+    request.state.correlation_id = correlation_id
+    response = await call_next(request)
+    response.headers["X-Correlation-ID"] = correlation_id
+    return response
 
 
 @app.exception_handler(Exception)

@@ -315,7 +315,7 @@ async def skill_p_pg_backup() -> dict:
         proc = await asyncio.create_subprocess_exec(
             "pg_dump",
             "--no-password",
-            db_url.replace("postgresql://", ""),
+            f"--dbname={db_url}",
             "--format=plain",
             "--no-acl",
             "--no-owner",

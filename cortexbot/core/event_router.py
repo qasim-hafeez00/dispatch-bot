@@ -186,13 +186,6 @@ def register_default_handlers():
         """Handle carrier YES/NO from WhatsApp."""
         logger.info(f"Carrier decision event: {event['data']}")
 
-    async def _on_load_dispatched(event: dict):
-        """Start Phase 2 transit monitoring when load is dispatched."""
-        load_id = event["entity_id"]
-        from cortexbot.core.orchestrator_phase2 import start_transit_monitoring_tasks
-        from cortexbot.core.redis_client import get_state
-        state = await get_state(f"cortex:state:load:{load_id}") or {}
-        await start_transit_monitoring_tasks(load_id, state)
 
     async def _on_payment_received(event: dict):
         """Trigger post-payment financial pipeline."""
@@ -212,7 +205,6 @@ def register_default_handlers():
 
     event_router.register("RC_RECEIVED", _on_rc_received)
     event_router.register("CARRIER_DECISION", _on_carrier_decision)
-    event_router.register("LOAD_DISPATCHED", _on_load_dispatched)
     event_router.register("PAYMENT_RECEIVED", _on_payment_received)
     event_router.register("FRAUD_ALERT", _on_fraud_alert)
 

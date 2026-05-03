@@ -56,6 +56,7 @@ class LoadState(TypedDict):
     carrier_profile: dict
     # ── Search & Triage ──────────────────────────────────────
     raw_loads: List[dict]
+    eligible_loads: Optional[List[dict]]
     current_load: Optional[dict]
     load_queue: List[dict]
     origin_city: str
@@ -80,6 +81,7 @@ class LoadState(TypedDict):
     # ── Call & Confirm ───────────────────────────────────────
     bland_call_id: Optional[str]
     call_outcome: Optional[str]
+    calling_started_at: Optional[float]
     agreed_rate_cpm: Optional[float]
     locked_accessorials: Optional[dict]
     load_details_extracted: Optional[dict]
@@ -144,8 +146,11 @@ def route_after_triage(state: LoadState) -> str:
     if state.get("status") == "ELIGIBLE" and state.get("eligible_loads"):
         return "fraud_check"
     elif state.get("load_queue"):
-        state["current_load"] = state["load_queue"][0]
-        state["load_queue"] = state["load_queue"][1:]
+        # FIX: pop queue here as expected by unit tests
+        queue = list(state.get("load_queue") or [])
+        if queue:
+            state["current_load"] = queue[0]
+            state["load_queue"] = queue[1:]
         return "fraud_check"
     else:
         return "minimal_escalation"
@@ -182,9 +187,6 @@ def route_after_call(state: LoadState) -> str:
         return "carrier_confirmation"
     elif outcome in ("VOICEMAIL", "NO_ANSWER", "RATE_TOO_LOW", "LOAD_COVERED"):
         if state.get("load_queue"):
-            state["current_load"] = state["load_queue"][0]
-            state["load_queue"] = state["load_queue"][1:]
-            state["status"] = "ELIGIBLE"
             return "rate_intelligence"
         else:
             state["retry_count"] = state.get("retry_count", 0) + 1
@@ -202,8 +204,6 @@ def route_after_confirm(state: LoadState) -> str:
         return "book_load"
     elif decision == "REJECTED":
         if state.get("load_queue"):
-            state["current_load"] = state["load_queue"][0]
-            state["load_queue"] = state["load_queue"][1:]
             return "rate_intelligence"
         else:
             state["retry_count"] = state.get("retry_count", 0) + 1
@@ -290,8 +290,15 @@ async def run_triage(state: LoadState) -> LoadState:
 
 async def run_fraud_check(state: LoadState) -> LoadState:
     """WORKFLOW-1: Broker fraud check before committing rate intelligence resources."""
+    load_queue = list(state.get("load_queue") or [])
+    if not state.get("current_load") and load_queue:
+        current_load = load_queue[0]
+        load_queue = load_queue[1:]
+        state = {**state, "current_load": current_load, "load_queue": load_queue}
+    else:
+        current_load = state.get("current_load") or {}
+
     from cortexbot.skills.sx_fraud_detection import skill_x_fraud_detection
-    current_load = state.get("current_load") or {}
     broker_mc    = current_load.get("broker_mc") or state.get("broker_mc") or ""
     result = await skill_x_fraud_detection(
         broker_mc=broker_mc,
@@ -363,6 +370,11 @@ async def run_compliance_check(state: LoadState) -> LoadState:
     except Exception as e:
         logger.warning(f"Compliance check DB error for {carrier_id}: {e} — allowing booking")
 
+    agreed_rate = state.get("agreed_rate_cpm") or 0
+    rate_floor = float(state.get("carrier_rate_floor") or 0)
+    if agreed_rate and agreed_rate < rate_floor:
+        issues.append(f"Agreed rate ${agreed_rate:.2f}/mi below carrier floor ${rate_floor:.2f}/mi")
+
     blocked = len(issues) > 0
     updated = {
         **state,
@@ -376,6 +388,19 @@ async def run_compliance_check(state: LoadState) -> LoadState:
 
 
 async def run_rate_intel(state: LoadState) -> LoadState:
+    # Dequeue logic if coming from a failed call/confirm
+    load_queue = list(state.get("load_queue") or [])
+    if state.get("call_outcome") in ("VOICEMAIL", "NO_ANSWER", "RATE_TOO_LOW", "LOAD_COVERED") or state.get("carrier_decision") == "REJECTED":
+        if load_queue:
+            state = {
+                **state,
+                "current_load": load_queue[0],
+                "load_queue": load_queue[1:],
+                "status": "ELIGIBLE",
+                "call_outcome": None,
+                "carrier_decision": None,
+            }
+
     from cortexbot.skills.s07_rate_intelligence import skill_07_rate_intelligence
     result = await skill_07_rate_intelligence(state)
     await _save_checkpoint(state["load_id"], result)
@@ -384,10 +409,12 @@ async def run_rate_intel(state: LoadState) -> LoadState:
 
 async def run_voice_call(state: LoadState) -> LoadState:
     from cortexbot.agents.voice_calling import agent_g_voice_call
+    import time
     result = await agent_g_voice_call(state)
-    await _save_checkpoint(state["load_id"], result)
     if result.get("status") == "CALLING":
+        result["calling_started_at"] = time.time()
         logger.info(f"⏸️ Workflow suspended — awaiting call: {state['load_id']}")
+    await _save_checkpoint(state["load_id"], result)
     return result
 
 
@@ -599,8 +626,8 @@ async def _watch_gps_dark(load_id: str, state: dict):
 
 
 async def run_collect_pod(state: LoadState) -> LoadState:
-    from cortexbot.skills.s17_pod_invoicing import skill_17_pod_invoicing
-    result = await skill_17_pod_invoicing(state)
+    from cortexbot.skills.s17_pod_invoicing import skill_17_validate_pod_receipt
+    result = await skill_17_validate_pod_receipt(state)
     result["pod_collected"] = True
     await _save_checkpoint(state["load_id"], result)
     return result

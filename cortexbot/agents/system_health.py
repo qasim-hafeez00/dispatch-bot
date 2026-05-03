@@ -111,6 +111,7 @@ async def run_health_monitor():
     Called from main.py lifespan startup.
     """
     logger.info("🩺 [E] System health monitor started")
+    asyncio.create_task(_check_stuck_calling_loads_loop(), name="stuck_calling_monitor")
 
     while True:
         try:
@@ -124,6 +125,52 @@ async def run_health_monitor():
             logger.error(f"[E] Health monitor error: {e}", exc_info=True)
 
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
+
+async def _check_stuck_calling_loads_loop():
+    """Loop to check for loads stuck in CALLING state (Phase 1 GAP FIX)."""
+    while True:
+        try:
+            await _check_stuck_calling_loads()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[E] Stuck calling check error: {e}")
+        await asyncio.sleep(300)  # Check every 5 minutes
+
+
+async def _check_stuck_calling_loads():
+    """
+    Find loads in CALLING status for > 15 minutes.
+    Triggers Agent C escalation.
+    """
+    from cortexbot.core.redis_client import get_redis, get_state, set_state
+    r = get_redis()
+    keys = await r.keys("cortex:state:load:*")
+    now = time.time()
+
+    for key in keys:
+        state = await get_state(key)
+        if state and state.get("status") == "CALLING":
+            started_at = state.get("calling_started_at")
+            if started_at and (now - started_at) > 900:  # 15 minutes
+                load_id = state.get("load_id")
+                logger.warning(f"🕒 Load {load_id} stuck in CALLING for {int((now-started_at)/60)} min")
+
+                # Trigger Agent C escalation
+                from cortexbot.agents.escalation import skill_c_escalate, EscalationScenario
+                await skill_c_escalate(
+                    scenario=EscalationScenario.CALL_FAILED_3X,
+                    state=state,
+                    context={"reason": f"Call stuck in CALLING state for {int((now-started_at)/60)} min"}
+                )
+
+                # Update state to prevent repeated alerts
+                state["status"] = "CALL_TIMEOUT"
+                state["error_log"] = state.get("error_log", []) + [
+                    f"Call timeout after 15 min at {datetime.now(timezone.utc).isoformat()}"
+                ]
+                await set_state(key, state)
 
 
 async def collect_health_snapshot() -> dict:

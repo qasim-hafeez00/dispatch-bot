@@ -101,17 +101,18 @@ async def wait_for_carrier_decision(load_id: str, timeout_secs: int = 90) -> Opt
     Wait up to timeout_secs for carrier to reply YES/NO via WhatsApp.
     Returns "CONFIRMED", "REJECTED", or None on timeout.
     """
-    r = get_redis()
+    channel = f"cortex:decision:{load_id}"
+    pubsub  = r.pubsub()
+    # FIX: Subscribe BEFORE checking stored value to prevent race condition
+    await pubsub.subscribe(channel)
 
     stored = await r.get(f"cortex:decision:stored:{load_id}")
     if stored:
         data = json.loads(stored)
         await r.delete(f"cortex:decision:stored:{load_id}")
+        # We still return the stored value, but since we are subscribed,
+        # we don't miss anything that arrives right now.
         return data.get("decision")
-
-    channel = f"cortex:decision:{load_id}"
-    pubsub  = r.pubsub()
-    await pubsub.subscribe(channel)
 
     try:
         deadline = asyncio.get_running_loop().time() + timeout_secs

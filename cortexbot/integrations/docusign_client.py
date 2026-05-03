@@ -53,17 +53,21 @@ async def _sign_locally(pdf_url: str, signer_name: str, load_id: str) -> str:
     # Download PDF
     pdf_bytes = await _download_pdf(pdf_url)
 
-    # Add signature text to last page
-    pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page    = pdf_doc[-1]  # Last page usually has signature line
+    # Add signature text to last page (wrap blocking PyMuPDF in executor)
+    import asyncio
+    loop = asyncio.get_running_loop()
 
-    # Add signature text
-    sig_text = f"Electronically signed by: {signer_name}\nDate: {datetime.now().strftime('%m/%d/%Y %H:%M')}\nCortexBot Dispatch"
-    rect     = fitz.Rect(50, page.rect.height - 100, 350, page.rect.height - 50)
-    page.insert_textbox(rect, sig_text, fontsize=9, color=(0, 0, 0.8))
+    def _apply_signature():
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pg = doc[-1]
+        sig_text = f"Electronically signed by: {signer_name}\nDate: {datetime.now().strftime('%m/%d/%Y %H:%M')}\nCortexBot Dispatch"
+        rt = fitz.Rect(50, pg.rect.height - 100, 350, pg.rect.height - 50)
+        pg.insert_textbox(rt, sig_text, fontsize=9, color=(0, 0, 0.8))
+        res = doc.write()
+        doc.close()
+        return res
 
-    signed_bytes = pdf_doc.write()
-    pdf_doc.close()
+    signed_bytes = await loop.run_in_executor(None, _apply_signature)
 
     # Upload to S3
     s3    = boto3.client("s3",
@@ -111,7 +115,7 @@ async def _download_pdf(url: str) -> bytes:
                 region_name=settings.aws_region)
         loop = asyncio.get_running_loop()
         obj = await loop.run_in_executor(None, lambda: s3.get_object(Bucket=bucket, Key=key))
-        return obj["Body"].read()
+        return await loop.run_in_executor(None, lambda: obj["Body"].read())
     else:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, timeout=30)

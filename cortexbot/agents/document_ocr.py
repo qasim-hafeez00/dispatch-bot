@@ -264,22 +264,29 @@ async def _claude_vision_extract(pdf_bytes: bytes, doc_type: str = "RC") -> dict
         client = AsyncAnthropic(api_key=settings.anthropic_api_key)
         
         # Render all pages (up to 3) so multi-page RCs are fully covered.
-        import fitz
-        pdf_doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
-        mat      = fitz.Matrix(2, 2)
-        content: list = []
-        for page_idx in range(min(len(pdf_doc), 3)):
-            pix       = pdf_doc[page_idx].get_pixmap(matrix=mat)
-            img_b64   = base64.standard_b64encode(pix.tobytes("jpeg")).decode()
-            content.append({
-                "type": "image",
-                "source": {
-                    "type":       "base64",
-                    "media_type": "image/jpeg",
-                    "data":       img_b64,
-                },
-            })
-        pdf_doc.close()
+        import asyncio
+        loop = asyncio.get_running_loop()
+
+        def _render_pages():
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            mat = fitz.Matrix(2, 2)
+            imgs = []
+            for page_idx in range(min(len(doc), 3)):
+                pix = doc[page_idx].get_pixmap(matrix=mat)
+                img_b64 = base64.standard_b64encode(pix.tobytes("jpeg")).decode()
+                imgs.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img_b64,
+                    },
+                })
+            doc.close()
+            return imgs
+
+        content: list = await loop.run_in_executor(None, _render_pages)
         content.append({"type": "text", "text": RC_EXTRACT_PROMPT})
 
         response = await client.messages.create(

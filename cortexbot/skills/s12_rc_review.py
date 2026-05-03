@@ -174,8 +174,62 @@ def _compare_fields(rc: dict, negotiated: dict, state: dict) -> list:
 
     # ── Detention check ─────────────────────────────────────────
     locked = state.get("locked_accessorials", {})
-    if locked.get("detention_rate") and not rc.get("detention_rate_per_hour"):
+    if locked.get("detention_rate_hr") and not rc.get("detention_rate_per_hour"):
         issues.append("WARNING: Detention rate agreed verbally but missing from RC")
+
+    # ── TONU (Truck Ordered Not Used) check ──────────────────────
+    # GAP FIX: if we negotiated TONU protection verbally it MUST be on the RC —
+    # otherwise broker can refuse to pay if they cancel at the last minute.
+    tonu_agreed = state.get("tonu_amount") or locked.get("tonu_amount")
+    tonu_on_rc  = rc.get("tonu_amount") or rc.get("tonu")
+    if tonu_agreed and not tonu_on_rc:
+        issues.append(
+            f"CRITICAL: TONU of ${tonu_agreed} agreed verbally but not on RC. "
+            f"Broker must add TONU clause before we sign."
+        )
+
+    # ── Layover check ────────────────────────────────────────────
+    layover_agreed = state.get("layover_rate") or locked.get("layover_rate")
+    layover_on_rc  = rc.get("layover_rate") or rc.get("layover")
+    if layover_agreed and not layover_on_rc:
+        issues.append(
+            f"WARNING: Layover rate of ${layover_agreed}/day agreed but not on RC"
+        )
+
+    # ── Extra stops check ────────────────────────────────────────
+    extra_stop_agreed = state.get("extra_stop_rate") or locked.get("extra_stop_rate")
+    extra_stop_on_rc  = rc.get("extra_stop_rate") or rc.get("extra_stops")
+    if extra_stop_agreed and not extra_stop_on_rc:
+        issues.append(
+            f"WARNING: Extra stop pay of ${extra_stop_agreed} agreed but not on RC"
+        )
+
+    # ── Quick-pay fee check ──────────────────────────────────────
+    # If carrier uses factoring, quick-pay discount should be noted on RC
+    # so broker doesn't accidentally deduct it from standard payment.
+    factoring_company = state.get("factoring_company") or ""
+    quick_pay_pct_rc  = rc.get("quick_pay_pct") or rc.get("quick_pay_fee")
+    state_qp_pct      = state.get("quick_pay_pct")
+    if state_qp_pct and quick_pay_pct_rc:
+        if abs(float(quick_pay_pct_rc) - float(state_qp_pct)) > 0.005:
+            issues.append(
+                f"WARNING: Quick-pay fee mismatch — RC has {quick_pay_pct_rc*100:.1f}%, "
+                f"agreed {state_qp_pct*100:.1f}%"
+            )
+
+    # ── Factoring assignment check ───────────────────────────────
+    # If carrier uses factoring, RC must show the factoring company as payee
+    # (via NOA). If RC still shows the carrier as payee the factoring company
+    # won't fund the invoice.
+    if factoring_company:
+        rc_payee = str(rc.get("remit_to", "") or rc.get("payee", "")).upper()
+        fc_upper = factoring_company.upper()
+        if rc_payee and fc_upper not in rc_payee:
+            issues.append(
+                f"CRITICAL: Carrier uses factoring ({factoring_company}) but RC "
+                f"remit-to shows '{rc.get('remit_to')}'. Broker must update payee "
+                f"to factoring company before we sign."
+            )
 
     # ── Payment terms longer than agreed ──────────────────────
     rc_terms     = rc.get("payment_terms_days")

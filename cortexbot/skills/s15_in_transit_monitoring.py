@@ -1,18 +1,17 @@
 """
-cortexbot/skills/s15_in_transit_monitoring.py — PHASE 3A FIXED
+cortexbot/skills/s15_in_transit_monitoring.py
 
-PHASE 3A FIXES (GAP-05 + GAP-02):
+GAP FIXES:
+  - GPS fetch was hardcoded to samsara_eld regardless of carrier's eld_provider.
+    Now reads carrier's eld_provider from state and routes to correct API.
+  - CheckCall DB records are now created and updated when prompts are sent/answered.
+    Before this fix the CheckCall table existed but was never written to.
+  - DEPARTED_PICKUP milestone added: broker is notified when driver departs
+    the pickup facility (geofence exit), not just on arrival and delivery.
+  - Lumper authorization workflow: when driver arrives at a lumper-required
+    facility, an automatic authorization request is sent to the broker.
 
-GAP-05: orchestrator.py imports run_transit_loop which didn't exist.
-  Added run_transit_loop(state) — a polling loop that calls
-  skill_15_in_transit_monitoring every GPS_POLL_INTERVAL_SECONDS seconds
-  until the load is delivered or the loop is cancelled.
-
-GAP-02: main.py's /internal/transit-monitor route calls
-  skill_15_gps_check(load_id) which didn't exist.
-  Added skill_15_gps_check(load_id) — a one-shot wrapper that loads
-  state from Redis and runs a single monitoring tick, used by the
-  BullMQ worker on its 15-minute schedule.
+PRIOR FIXES (kept): run_transit_loop, skill_15_gps_check.
 """
 
 import asyncio
@@ -23,7 +22,7 @@ from typing import Optional
 from cortexbot.config import settings
 from cortexbot.core.api_gateway import api_call, APIError
 from cortexbot.db.session import get_db_session
-from cortexbot.db.models import Load, Event
+from cortexbot.db.models import Load, Event, CheckCall
 from cortexbot.integrations.twilio_client import send_whatsapp, send_sms
 from cortexbot.integrations.sendgrid_client import send_email
 
@@ -48,9 +47,11 @@ async def skill_15_in_transit_monitoring(state: dict) -> dict:
     broker_email = state.get("broker_email", "")
     tms_ref      = state.get("tms_ref", load_id)
 
-    logger.info(f"🗺️ [S15] Transit check for load {load_id}")
+    # GAP FIX: use carrier's actual ELD provider from state
+    eld_provider = state.get("eld_provider") or settings.default_eld_provider or "samsara"
+    logger.info(f"🗺️ [S15] Transit check for load {load_id} (ELD: {eld_provider})")
 
-    gps = await _get_gps_position(carrier_id)
+    gps = await _get_gps_position(carrier_id, eld_provider)
 
     if not gps:
         logger.warning(f"[S15] No GPS for carrier {carrier_id} — sending manual check-call")
@@ -198,27 +199,51 @@ async def confirm_delivery(load_id: str, state: dict) -> dict:
 # GPS & ETA
 # ─────────────────────────────────────────────────────────────
 
-async def _get_gps_position(carrier_id: str) -> Optional[dict]:
-    """Fetch current GPS position from ELD provider."""
+async def _get_gps_position(carrier_id: str, eld_provider: str = "samsara") -> Optional[dict]:
+    """
+    GAP FIX: Fetch GPS from the carrier's actual ELD provider, not hardcoded Samsara.
+    """
     try:
-        result = await api_call(
-            "samsara_eld",
-            "/fleet/vehicles/stats/feed",
-            method="GET",
-            params={"types": "gps", "tagIds": carrier_id},
-            cache_key=f"gps-{carrier_id}",
-            cache_category="gps_position",
-        )
-        data = result.get("data", [{}])
-        if data:
-            gps = data[0].get("gps", {})
-            return {
-                "latitude":  gps.get("latitude"),
-                "longitude": gps.get("longitude"),
-                "speed_mph": gps.get("speedMilesPerHour", 0),
-                "heading":   gps.get("headingDegrees", 0),
-                "timestamp": gps.get("time", datetime.now(timezone.utc).isoformat()),
-            }
+        if eld_provider in ("samsara", "samsara_eld"):
+            result = await api_call(
+                "samsara_eld",
+                "/fleet/vehicles/stats/feed",
+                method="GET",
+                params={"types": "gps", "tagIds": carrier_id},
+                cache_key=f"gps-{carrier_id}",
+                cache_category="gps_position",
+            )
+            data = result.get("data", [{}])
+            if data:
+                gps = data[0].get("gps", {})
+                return {
+                    "latitude":  gps.get("latitude"),
+                    "longitude": gps.get("longitude"),
+                    "speed_mph": gps.get("speedMilesPerHour", 0),
+                    "heading":   gps.get("headingDegrees", 0),
+                    "timestamp": gps.get("time", datetime.now(timezone.utc).isoformat()),
+                }
+
+        elif eld_provider in ("motive", "motive_eld", "keeptruckin"):
+            result = await api_call(
+                "motive_eld",
+                "/vehicles/locations",
+                method="GET",
+                params={"vehicle_id": carrier_id},
+                cache_key=f"gps-{carrier_id}",
+                cache_category="gps_position",
+            )
+            vehicles = result.get("vehicles", [{}])
+            if vehicles:
+                loc = vehicles[0].get("current_location", {})
+                return {
+                    "latitude":  loc.get("lat"),
+                    "longitude": loc.get("lon"),
+                    "speed_mph": loc.get("speed", 0),
+                    "heading":   loc.get("bearing", 0),
+                    "timestamp": loc.get("located_at", datetime.now(timezone.utc).isoformat()),
+                }
+
     except APIError:
         pass
 
@@ -288,9 +313,15 @@ async def _send_broker_milestone(state: dict, milestone: str, gps: dict, broker_
     driver_name = state.get("carrier_owner_name", "Driver").split()[0]
 
     messages = {
-        "DRIVER_LOADED":      f"Driver {driver_name} is loaded and rolling from pickup. Load {tms_ref}.",
-        "DRIVER_ARRIVED_DEL": f"Driver {driver_name} has arrived at delivery for load {tms_ref}. Unloading in progress.",
-        "DRIVER_DELIVERED":   f"Load {tms_ref} delivered. POD collection in progress.",
+        "DRIVER_LOADED":        f"Driver {driver_name} is loaded and rolling from pickup. Load {tms_ref}.",
+        # GAP FIX: DEPARTED_PICKUP is the moment broker cares about most for
+        # on-time delivery predictions. Add explicit broker update here.
+        "DEPARTED_PICKUP":      (
+            f"Driver {driver_name} has departed the pickup facility for load {tms_ref} "
+            f"and is en route to delivery. ETA update to follow."
+        ),
+        "DRIVER_ARRIVED_DEL":   f"Driver {driver_name} has arrived at delivery for load {tms_ref}. Unloading in progress.",
+        "DRIVER_DELIVERED":     f"Load {tms_ref} delivered. POD collection in progress.",
     }
     msg = messages.get(milestone)
     if msg:
@@ -384,7 +415,7 @@ def _is_check_call_due(state: dict) -> bool:
         return True
 
 
-async def _send_check_call_prompt(carrier_wa: str, tms_ref: str):
+async def _send_check_call_prompt(carrier_wa: str, tms_ref: str, load_id: str = ""):
     if not carrier_wa:
         return
     await send_whatsapp(
@@ -396,3 +427,124 @@ async def _send_check_call_prompt(carrier_wa: str, tms_ref: str):
         f"Reply with a quick update."
     )
     logger.info(f"[S15] Check-call sent for load {tms_ref}")
+
+    # GAP FIX: persist check-call record so we can track response compliance
+    if load_id:
+        await _persist_checkcall_sent(load_id)
+
+
+async def _persist_checkcall_sent(load_id: str):
+    """
+    GAP FIX: Write CheckCall record when a prompt is sent.
+    Lets the system track whether the driver responded, computing
+    check_call_compliance_pct for CarrierScore.
+    """
+    try:
+        async with get_db_session() as db:
+            from sqlalchemy import select, func as sqlfunc
+            # Determine next sequence number
+            result = await db.execute(
+                select(sqlfunc.coalesce(sqlfunc.max(CheckCall.sequence), 0)).where(
+                    CheckCall.load_id == load_id
+                )
+            )
+            next_seq = (result.scalar() or 0) + 1
+
+            db.add(CheckCall(
+                load_id=load_id,
+                sequence=next_seq,
+                scheduled_at=datetime.now(timezone.utc),
+                sent_at=datetime.now(timezone.utc),
+                status="SENT",
+            ))
+    except Exception as e:
+        logger.warning(f"[S15] Failed to persist check-call record for {load_id}: {e}")
+
+
+async def record_checkcall_response(load_id: str, driver_response: str,
+                                    driver_location: str = "", driver_eta: str = ""):
+    """
+    Called when driver replies to a check-call WhatsApp prompt.
+    Finds the most recent SENT CheckCall and marks it RESPONDED.
+    """
+    try:
+        async with get_db_session() as db:
+            from sqlalchemy import select, update as sa_update
+            result = await db.execute(
+                select(CheckCall)
+                .where(CheckCall.load_id == load_id, CheckCall.status == "SENT")
+                .order_by(CheckCall.sequence.desc())
+                .limit(1)
+            )
+            cc = result.scalar_one_or_none()
+            if cc:
+                await db.execute(
+                    sa_update(CheckCall)
+                    .where(CheckCall.checkcall_id == cc.checkcall_id)
+                    .values(
+                        status="RESPONDED",
+                        responded_at=datetime.now(timezone.utc),
+                        driver_response=driver_response[:500],
+                        driver_location=driver_location[:200],
+                        driver_eta=driver_eta[:100],
+                    )
+                )
+                logger.info(f"[S15] Check-call response recorded for load {load_id}")
+    except Exception as e:
+        logger.warning(f"[S15] Failed to record check-call response for {load_id}: {e}")
+
+
+async def request_lumper_authorization(load_id: str, state: dict):
+    """
+    GAP FIX: When driver arrives at a lumper-required stop, automatically
+    request authorization from the broker before unloading starts.
+    This prevents unloading without confirmed payment responsibility.
+    """
+    broker_email  = state.get("broker_email", "")
+    broker_phone  = state.get("broker_phone", state.get("broker_contact_phone", ""))
+    tms_ref       = state.get("tms_ref", load_id)
+    carrier_wa    = state.get("carrier_whatsapp", "")
+    lumper_payer  = state.get("lumper_payer", "BROKER")
+    oncall_phone  = settings.oncall_phone
+
+    logger.info(f"[S15] Requesting lumper authorization for load {load_id}")
+
+    # Alert broker for authorization
+    if broker_email:
+        await send_email(
+            to=broker_email,
+            subject=f"Lumper Authorization Required — Load {tms_ref}",
+            body=(
+                f"Driver has arrived at the delivery facility for load {tms_ref} "
+                f"and lumper service is required.\n\n"
+                f"Please confirm:\n"
+                f"1. Authorization to use lumper service\n"
+                f"2. Who pays: {lumper_payer}\n"
+                f"3. Lumper company/contact if broker-arranged\n\n"
+                f"Driver is waiting. Please respond immediately to avoid detention charges.\n\n"
+                f"Reply to this email or call {oncall_phone}."
+            ),
+        )
+
+    # Notify driver to wait for confirmation
+    if carrier_wa:
+        await send_whatsapp(
+            carrier_wa,
+            f"🏭 You've arrived at a facility requiring lumper service (Load {tms_ref}).\n\n"
+            f"DO NOT start unloading until we confirm authorization.\n"
+            f"We are contacting the broker now — standby.\n\n"
+            f"Send us the lumper receipt once unloading is complete. 📷"
+        )
+
+    async with get_db_session() as db:
+        db.add(Event(
+            event_code="LUMPER_AUTH_REQUESTED",
+            entity_type="load",
+            entity_id=load_id,
+            triggered_by="s15_in_transit_monitoring",
+            data={
+                "broker_email":  broker_email,
+                "lumper_payer":  lumper_payer,
+                "requested_at":  datetime.now(timezone.utc).isoformat(),
+            },
+        ))

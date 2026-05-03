@@ -30,7 +30,7 @@ logger = logging.getLogger("cortexbot.skills.s17")
 
 async def skill_17_pod_invoicing(state: dict) -> dict:
     """
-    Main entry — generate invoice and submit after delivery.
+    Main entry — collect lumper receipt if needed, then generate and submit invoice.
     """
     load_id      = state["load_id"]
     carrier_id   = state["carrier_id"]
@@ -39,6 +39,20 @@ async def skill_17_pod_invoicing(state: dict) -> dict:
     tms_ref      = state.get("tms_ref", load_id)
 
     logger.info(f"💰 [S17] Generating invoice for load {load_id}")
+
+    # GAP FIX: if lumper was required and receipt not yet collected, prompt driver
+    # before generating the invoice so we can include it as a billable line item.
+    if state.get("lumper_required") and not state.get("lumper_receipt_url"):
+        if carrier_wa:
+            await send_whatsapp(
+                carrier_wa,
+                f"📋 Load {tms_ref} — lumper service was used.\n\n"
+                f"Please send a CLEAR photo of the lumper receipt NOW.\n"
+                f"We need it to bill the broker for reimbursement.\n\n"
+                f"Without the receipt we cannot recover the lumper cost. 📸"
+            )
+        logger.info(f"[S17] Lumper receipt requested for load {load_id} — invoicing will proceed regardless")
+        # We proceed with invoicing anyway (don't block payment) but log the gap
 
     # Calculate all line items
     linehaul_rate = float(state.get("agreed_rate_cpm") or 0) * int(state.get("loaded_miles") or 0)
@@ -153,9 +167,11 @@ def _generate_invoice_pdf(state: dict, linehaul: float, access: dict,
         story.append(Spacer(1, 0.15*inch))
 
         # ── Parties ──────────────────────────────────────────
-        carrier_name  = state.get("broker_company", "Carrier Company")  # from carrier profile
+        # BUG FIX: was state.get("broker_company") for both FROM and TO,
+        # so the FROM (carrier) field showed the broker's company name.
+        carrier_name  = state.get("carrier_company_name") or state.get("carrier_profile", {}).get("company_name", "Carrier")
         broker_co     = state.get("broker_company", "Broker Company")
-        carrier_mc    = state.get("carrier_mc", "MC-XXXXXX")
+        carrier_mc    = state.get("carrier_mc") or state.get("carrier_profile", {}).get("mc_number", "MC-XXXXXX")
 
         parties_data = [
             ["FROM (CARRIER)", "TO (BROKER)"],

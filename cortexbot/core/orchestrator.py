@@ -161,13 +161,19 @@ def route_after_fraud(state: LoadState) -> str:
 def route_after_hos_precheck(state: LoadState) -> str:
     if state.get("hos_blocks_dispatch"):
         return "minimal_escalation"
-    return "voice_broker_call"
+    # GAP FIX: compliance check (insurance expiry, suspension) must gate BEFORE
+    # calling the broker. Previously it ran after carrier_confirmation, meaning
+    # we'd negotiate a rate, get carrier agreement, then discover expired COI —
+    # wasting the broker's time and leaving the load stranded.
+    return "compliance_check"
 
 
 def route_after_compliance(state: LoadState) -> str:
     if state.get("compliance_blocked"):
         return "minimal_escalation"
-    return "book_load"
+    # GAP FIX: compliance now runs pre-call (after HOS check), so on pass
+    # we go to voice_broker_call (previously went straight to book_load).
+    return "voice_broker_call"
 
 
 def route_after_call(state: LoadState) -> str:
@@ -192,7 +198,8 @@ def route_after_call(state: LoadState) -> str:
 def route_after_confirm(state: LoadState) -> str:
     decision = state.get("carrier_decision", "")
     if decision == "CONFIRMED":
-        return "compliance_check"
+        # GAP FIX: compliance already passed pre-call, go straight to booking
+        return "book_load"
     elif decision == "REJECTED":
         if state.get("load_queue"):
             state["current_load"] = state["load_queue"][0]
@@ -718,11 +725,13 @@ def build_phase2_graph():
     graph.add_conditional_edges("search_loads", route_after_search)
     graph.add_conditional_edges("triage_eligibility", route_after_triage)
     graph.add_conditional_edges("fraud_check", route_after_fraud)           # WORKFLOW-1
-    graph.add_edge("rate_intelligence", "hos_precheck")                     # WORKFLOW-2
-    graph.add_conditional_edges("hos_precheck", route_after_hos_precheck)   # WORKFLOW-2
+    graph.add_edge("rate_intelligence", "hos_precheck")                          # WORKFLOW-2
+    graph.add_conditional_edges("hos_precheck", route_after_hos_precheck)        # WORKFLOW-2
+    # GAP FIX: compliance_check now runs BEFORE voice call, not after carrier_confirm.
+    # New order: hos_precheck → compliance_check → voice_broker_call → carrier_confirm → book_load
+    graph.add_conditional_edges("compliance_check", route_after_compliance)       # WORKFLOW-3 (moved)
     graph.add_conditional_edges("voice_broker_call", route_after_call)
     graph.add_conditional_edges("carrier_confirmation", route_after_confirm)
-    graph.add_conditional_edges("compliance_check", route_after_compliance)  # WORKFLOW-4
     graph.add_edge("book_load", "complete_packet")
     graph.add_edge("complete_packet", "review_rc")
     graph.add_conditional_edges("review_rc", route_after_rc)

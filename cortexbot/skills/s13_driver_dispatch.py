@@ -28,7 +28,7 @@ from typing import Optional
 from cortexbot.config import settings
 from cortexbot.core.api_gateway import api_call, APIError
 from cortexbot.db.session import get_db_session
-from cortexbot.db.models import Load, Carrier, Event
+from cortexbot.db.models import Load, Carrier, Event, CheckCall
 from cortexbot.integrations.twilio_client import send_whatsapp, send_sms
 from cortexbot.integrations.sendgrid_client import send_email
 
@@ -137,9 +137,12 @@ async def skill_13_driver_dispatch(state: dict) -> dict:
         )
 
     # ── 6. GAP-13 FIX: Register geo-fences ────────────────────
-    # Must happen AFTER dispatch is confirmed so ELD providers
-    # send us arrival/departure events for detention tracking.
     geofence_results = await _register_load_geofences(state)
+
+    # ── 7. Create scheduled check-call records ─────────────────
+    # GAP FIX: CheckCall model existed but was never populated on dispatch.
+    # Now we create the full schedule upfront so compliance can be tracked.
+    await _create_checkcall_schedule(load_id, state)
 
     updated_state = {
         **state,
@@ -417,6 +420,72 @@ async def _ensure_coords(
 
 
 # ─────────────────────────────────────────────────────────────
+# GAP FIX: CHECK-CALL SCHEDULE
+# ─────────────────────────────────────────────────────────────
+
+async def _create_checkcall_schedule(load_id: str, state: dict):
+    """
+    GAP FIX: Create the full check-call schedule in DB at dispatch time.
+
+    Schedule:
+      1. DEPART_PU   — after estimated pickup window (confirm driver loaded + departed)
+      2. EN_ROUTE_2H — 2 hours after departure
+      3. EN_ROUTE_4H — 4 hours after departure (long-haul only)
+      4. ARRIVAL_DEL — 1 hour before estimated delivery time
+      5. EMPTY       — after delivery window (confirm empty + BOL photos)
+    """
+    from datetime import timedelta
+    from cortexbot.db.models import CheckCall
+
+    pickup_time  = state.get("pickup_appt_time")
+    delivery_date = state.get("delivery_date")
+    pickup_date  = state.get("pickup_date")
+    loaded_miles = state.get("loaded_miles") or 500
+    now          = datetime.now(timezone.utc)
+
+    # Estimate departure ~2 hours after pickup window opens
+    try:
+        from datetime import date as date_cls, time as time_cls
+        if pickup_date and pickup_time:
+            pu_dt  = datetime.fromisoformat(f"{pickup_date}T{str(pickup_time)[:8]}+00:00")
+            depart = pu_dt + timedelta(hours=2)
+        else:
+            depart = now + timedelta(hours=4)
+    except Exception:
+        depart = now + timedelta(hours=4)
+
+    # Average trucking speed ~55 mph for travel-time estimate
+    travel_hours = max(loaded_miles / 55, 4)
+    est_arrival  = depart + timedelta(hours=travel_hours)
+
+    schedule = [
+        (1, "DEPART_PU",   depart),
+        (2, "EN_ROUTE_2H", depart + timedelta(hours=2)),
+        (3, "ARRIVAL_DEL", est_arrival - timedelta(hours=1)),
+        (4, "EMPTY",       est_arrival + timedelta(hours=2)),
+    ]
+
+    # Add mid-route check for loads over 400 miles
+    if loaded_miles > 400:
+        schedule.insert(2, (3, "EN_ROUTE_MIDWAY", depart + timedelta(hours=travel_hours / 2)))
+        # Renumber
+        schedule = [(i + 1, label, ts) for i, (_, label, ts) in enumerate(schedule)]
+
+    try:
+        async with get_db_session() as db:
+            for seq, label, scheduled_at in schedule:
+                db.add(CheckCall(
+                    load_id=load_id,
+                    sequence=seq,
+                    scheduled_at=scheduled_at,
+                    status="PENDING",
+                ))
+        logger.info(f"[S13] Created {len(schedule)} check-call records for load {load_id}")
+    except Exception as e:
+        logger.warning(f"[S13] Failed to create check-call schedule for {load_id}: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
 # DISPATCH MESSAGE BUILDER
 # ─────────────────────────────────────────────────────────────
 
@@ -461,6 +530,37 @@ def _build_dispatch_message(state: dict) -> str:
     elif broker_name:
         broker_contact_str = f"📞 Broker: {broker_name}\n"
 
+    # ── FCFS vs appointment type ──────────────────────────────
+    pickup_appt_type = state.get("pickup_appt_type", "")
+    appt_type_str = ""
+    if pickup_appt_type == "FCFS":
+        appt_type_str = "⚡ *PICKUP: FIRST COME FIRST SERVED* — arrive early!\n"
+    elif pickup_appt_type in ("APPT", "appointment"):
+        appt_type_str = f"📅 *Pickup appointment required* @ {pickup_appt}\n"
+
+    # ── Equipment confirmation (GAP FIX) ─────────────────────
+    equip_upper = equip.upper()
+    equip_check_lines = []
+    if "FLAT" in equip_upper or "STEP" in equip_upper or "LOWBOY" in equip_upper:
+        straps = state.get("carrier_profile", {}).get("straps_count", "")
+        tarps  = state.get("carrier_profile", {}).get("tarp_capable", False)
+        equip_check_lines.append(f"🔗 Confirm you have chains/straps{' and tarps' if tarps else ''} on board")
+    elif "REEFER" in equip_upper:
+        temp_min = state.get("temp_min_f")
+        temp_max = state.get("temp_max_f")
+        if temp_min is not None or temp_max is not None:
+            equip_check_lines.append(
+                f"🌡️ Set temp: {temp_min}°F–{temp_max}°F before arriving at shipper"
+            )
+        equip_check_lines.append("🔒 Confirm load locks on board")
+    elif "VAN" in equip_upper or "DRY" in equip_upper:
+        equip_check_lines.append("🔒 Confirm load locks on board")
+
+    equip_confirm_str = (
+        "\n".join(f"⬜ {line}" for line in equip_check_lines) + "\n"
+        if equip_check_lines else ""
+    )
+
     return (
         f"🚛 *DISPATCH — Load {tms_ref}*\n\n"
         f"📍 *FROM:* {origin_city}, {origin_state}\n"
@@ -469,6 +569,7 @@ def _build_dispatch_message(state: dict) -> str:
         f"⚖️ Weight: {weight_str}\n"
         f"🏷️ Equipment: {equip}\n\n"
         f"🗓️ *PICKUP:* {pickup_date} @ {pickup_appt}\n"
+        f"{appt_type_str}"
         f"🗓️ *DELIVERY:* {del_date}\n\n"
         f"💰 Rate: {rate_display}\n"
         f"{det_str}"
@@ -476,6 +577,7 @@ def _build_dispatch_message(state: dict) -> str:
         f"\n"
         f"{broker_contact_str}"
         f"\n"
+        f"{equip_confirm_str}"
         f"✅ *Reply BOL photo when loaded*\n"
         f"✅ *Reply DELIVERED when done*\n"
         f"✅ *Reply HELP anytime for commands*"

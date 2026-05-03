@@ -211,21 +211,21 @@ async def test_full_phase1_routing_chain(base_state, mock_redis):
     state["fraud_recommendation"] = "BOOK"
     assert route_after_fraud(state) == "rate_intelligence"
 
-    # 4. HOS ok → voice_broker_call
+    # 4. HOS ok → compliance_check (GAP FIX: compliance gates before broker call)
     state["hos_blocks_dispatch"] = False
-    assert route_after_hos_precheck(state) == "voice_broker_call"
+    assert route_after_hos_precheck(state) == "compliance_check"
 
-    # 5. Call booked → carrier_confirmation
+    # 5. Compliance passed → voice_broker_call (GAP FIX: new position)
+    state["compliance_blocked"] = False
+    assert route_after_compliance(state) == "voice_broker_call"
+
+    # 6. Call booked → carrier_confirmation
     state["call_outcome"] = "BOOKED"
     assert route_after_call(state) == "carrier_confirmation"
 
-    # 6. Carrier confirmed → compliance_check
+    # 7. Carrier confirmed → book_load (GAP FIX: compliance already passed pre-call)
     state["carrier_decision"] = "CONFIRMED"
-    assert route_after_confirm(state) == "compliance_check"
-
-    # 7. Compliance passed → book_load
-    state["compliance_blocked"] = False
-    assert route_after_compliance(state) == "book_load"
+    assert route_after_confirm(state) == "book_load"
 
     # 8. RC signed → dispatch_driver
     state.update({"rc_discrepancy_found": False, "rc_signed_url": "http://example.com/rc.pdf"})

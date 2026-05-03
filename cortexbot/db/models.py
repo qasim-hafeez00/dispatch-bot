@@ -81,6 +81,29 @@ class Carrier(Base):
     w9_url             = Column(Text, nullable=True)
     coi_url            = Column(Text, nullable=True)
 
+    # ── Equipment capabilities (GAP FIX — were missing) ──────
+    tarp_capable       = Column(Boolean, default=False)
+    straps_count       = Column(Integer, nullable=True)
+    load_locks_qty     = Column(Integer, nullable=True)
+    team_capable       = Column(Boolean, default=False)
+    reefer_temp_min_f  = Column(Numeric(5, 1), nullable=True)
+    reefer_temp_max_f  = Column(Numeric(5, 1), nullable=True)
+    max_loaded_length_ft = Column(Integer, default=53)
+    commodity_exclusions = Column(ARRAY(String), nullable=True)
+
+    # ── Geographic constraints (GAP FIX — were missing) ──────
+    avoid_nyc          = Column(Boolean, default=False)
+    avoid_ports        = Column(Boolean, default=False)
+    canada_ok          = Column(Boolean, default=False)
+
+    # ── Carrier preferences (GAP FIX — were missing) ─────────
+    preferred_home_time_days = Column(Integer, nullable=True)
+    comm_start_hour    = Column(Integer, nullable=True)  # 0-23, e.g. 6 = 6 AM
+    comm_end_hour      = Column(Integer, nullable=True)  # 0-23, e.g. 22 = 10 PM
+
+    # ── Compliance docs (GAP FIX — cdl_url was missing) ──────
+    cdl_url            = Column(Text, nullable=True)
+
     # ── Phase 2 ELD ──────────────────────────────────────────
     eld_provider       = Column(String(30), nullable=True)
     eld_vehicle_id     = Column(String(100), nullable=True)

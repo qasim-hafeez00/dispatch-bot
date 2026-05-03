@@ -108,8 +108,9 @@ def test_route_after_fraud_default_proceeds(base_state):
 # ─────────────────────────────────────────────────────────────
 
 def test_route_after_hos_precheck_ok(base_state):
+    # GAP FIX: compliance now gates before broker call
     base_state["hos_blocks_dispatch"] = False
-    assert route_after_hos_precheck(base_state) == "voice_broker_call"
+    assert route_after_hos_precheck(base_state) == "compliance_check"
 
 
 def test_route_after_hos_precheck_blocked(base_state):
@@ -150,8 +151,9 @@ def test_route_after_call_calling_suspends(base_state):
 # ─────────────────────────────────────────────────────────────
 
 def test_route_after_confirm_confirmed(base_state):
+    # GAP FIX: compliance already passed pre-call, go straight to booking
     base_state["carrier_decision"] = "CONFIRMED"
-    assert route_after_confirm(base_state) == "compliance_check"
+    assert route_after_confirm(base_state) == "book_load"
 
 
 def test_route_after_confirm_rejected_with_queue(base_state):
@@ -171,8 +173,9 @@ def test_route_after_confirm_rejected_no_queue(base_state):
 # ─────────────────────────────────────────────────────────────
 
 def test_route_after_compliance_pass(base_state):
+    # GAP FIX: compliance now runs pre-call, routes to voice_broker_call on pass
     base_state["compliance_blocked"] = False
-    assert route_after_compliance(base_state) == "book_load"
+    assert route_after_compliance(base_state) == "voice_broker_call"
 
 
 def test_route_after_compliance_blocked(base_state):

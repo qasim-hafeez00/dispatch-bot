@@ -489,6 +489,28 @@ async def get_carrier(carrier_id: str):
     return await get_carrier_handler(carrier_id)
 
 
+@app.post("/api/carriers/onboard", tags=["Carriers"])
+async def onboard_carrier(request: Request):
+    """
+    Step 2 full carrier onboarding:
+    - Creates carrier record with all equipment/preference/constraint fields
+    - Uploads documents (W-9, COI, NOA, CDL) to S3 as base64 payloads
+    - Creates CarrierDocument records with expiry dates
+    - Triggers Agent AA: generates service agreement and sends via DocuSign
+    - Sends WhatsApp/SMS welcome with next steps
+
+    Documents should be base64-encoded PDF strings in these fields:
+      w9_b64, coi_auto_b64, coi_cargo_b64, noa_b64, cdl_b64
+    """
+    payload = await request.json()
+    from cortexbot.api.carriers import onboard_carrier_handler
+    result = await onboard_carrier_handler(payload)
+    if result.get("error"):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
 @app.post("/api/carriers/{carrier_id}/compliance-doc", tags=["Carriers"])
 async def add_compliance_doc(carrier_id: str, request: Request):
     payload = await request.json()
